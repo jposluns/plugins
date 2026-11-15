@@ -1,0 +1,28 @@
+{
+  "name": "jposluns",
+  "owner": {
+    "name": "Jeff Posluns"
+  },
+  "description": "Plugins for the jposluns projects. Each entry points at the project's own public repository or release zip.",
+  "plugins": [
+    {
+      "name": "secureconfig",
+      "description": "The secureconfig plugin, from the plugin folder of the jposluns/secureconfig repository.",
+      "source": {
+        "source": "git-subdir",
+        "url": "jposluns/secureconfig",
+        "path": "plugin",
+        "ref": "main"
+      }
+    },
+    {
+      "name": "auditthis",
+      "description": "The auditthis plugin, as a versioned zip from auditthis.ai.",
+      "source": {
+        "source": "archive",
+        "url": "https://auditthis.ai/downloads/auditthis-plugin-2.14.0.zip",
+        "sha256": "2c6acb53d8cc293b0515cbfab61bb00699b9852ec52171652981b7d27f99bddc"
+      }
+    }
+  ]
+}

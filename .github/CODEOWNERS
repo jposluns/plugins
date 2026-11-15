@@ -1,0 +1,7 @@
+# The owner is the required reviewer for the check, the checker and this file.
+# Entry-only pull requests change only .claude-plugin/marketplace.json, which
+# has no code owner; the marketplace-check job judges them.
+
+/.github/            @jposluns
+/tools/              @jposluns
+/.github/CODEOWNERS  @jposluns

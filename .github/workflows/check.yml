@@ -1,0 +1,97 @@
+name: Marketplace check
+
+# This workflow runs on pull_request_target, so GitHub takes this file from the
+# base branch, and the job takes tools/ from the base branch too. A pull request
+# cannot change the check that judges it.
+#
+# Rules for every later change to this file:
+#   - no step checks out, imports, sources or runs a file from the pull request;
+#   - the pull request's marketplace.json is read from git as a blob and given
+#     to the base branch's checker as data;
+#   - the token stays at contents: read, no secret is used, and
+#     persist-credentials stays false.
+
+on:
+  pull_request_target:
+
+permissions:
+  contents: read
+
+jobs:
+  marketplace-check:
+    name: marketplace-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      CATALOGUE: .claude-plugin/marketplace.json
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      # The base branch. For pull_request_target, github.sha is the last commit
+      # on the base branch. The full history is needed to find the merge base.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Checker self-test
+        shell: bash
+        run: python3 -I -B tools/check_marketplace.py --self-test
+
+      # Fetch the pull request's commits into the object store. Nothing is
+      # checked out, so the work tree stays the base branch.
+      - name: Read the pull request's marketplace.json as data
+        shell: bash
+        run: |
+          set -u
+          git fetch --quiet --no-tags --no-recurse-submodules origin \
+            "+refs/pull/${PR_NUMBER}/head:refs/remotes/pull-request/head"
+          fetched="$(git rev-parse --verify 'refs/remotes/pull-request/head^{commit}')"
+          if [ "$fetched" != "$PR_HEAD_SHA" ]; then
+            echo "This run is for commit ${PR_HEAD_SHA}, and the pull request is now at ${fetched}."
+            echo "The run for the newer commit decides."
+            exit 1
+          fi
+          entry="$(git ls-tree "$PR_HEAD_SHA" -- "$CATALOGUE")"
+          case "$entry" in
+            "100644 blob "*) ;;
+            *)
+              echo "${CATALOGUE} must be a regular file in the pull request. Found: ${entry:-nothing}"
+              exit 1
+              ;;
+          esac
+          blob="$(git rev-parse --verify "${PR_HEAD_SHA}:${CATALOGUE}")"
+          git cat-file blob "$blob" > "${RUNNER_TEMP}/marketplace.json"
+
+      - name: Check the pull request's marketplace.json
+        shell: bash
+        run: python3 -I -B tools/check_marketplace.py "${RUNNER_TEMP}/marketplace.json"
+
+      # Only an entry-only pull request can pass. A change to any other file
+      # needs the owner's review (see .github/CODEOWNERS and the README).
+      - name: Entry-only check
+        shell: bash
+        run: |
+          set -u
+          base="$(git rev-parse --verify 'HEAD^{commit}')"
+          merge_base="$(git merge-base --all "$base" "$PR_HEAD_SHA" || true)"
+          if ! [[ "$merge_base" =~ ^[0-9a-f]{40,64}$ ]]; then
+            echo "The pull request and the base branch must have exactly one merge base. Found:"
+            printf '%s\n' "${merge_base:-none}"
+            exit 1
+          fi
+          changed="$(git -c core.quotePath=true diff --name-only --no-renames \
+            --ignore-submodules=none "$merge_base" "$PR_HEAD_SHA" --)"
+          if [ "$changed" != "$CATALOGUE" ]; then
+            echo "This check passes only when the pull request changes ${CATALOGUE} and no other file."
+            echo "This pull request changes:"
+            printf '%s\n' "${changed:-(no file)}"
+            echo "A change to any other file needs the owner's review."
+            exit 1
+          fi
+          echo "The pull request changes only ${CATALOGUE}."

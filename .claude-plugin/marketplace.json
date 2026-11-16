@@ -20,8 +20,8 @@
       "description": "The auditthis plugin, as a versioned zip from auditthis.ai.",
       "source": {
         "source": "archive",
-        "url": "https://auditthis.ai/downloads/auditthis-plugin-2.15.0.zip",
-        "sha256": "ec7e206f11205b5e64349b4ac85af654e8c190c8eeac698cf0a3a0f3680d413f"
+        "url": "https://auditthis.ai/downloads/auditthis-plugin-2.15.1.zip",
+        "sha256": "473a034a81a9a1c606f7277b46f63582001e7039b576d201d84eddead6c61ea2"
       }
     }
   ]

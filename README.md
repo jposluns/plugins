@@ -16,10 +16,10 @@ Then install a plugin by name:
 
 ## Plugins
 
-| Plugin | Install line | Source |
-|---|---|---|
-| secureconfig | `/plugin install secureconfig@jposluns` | `plugin` folder of `jposluns/secureconfig`, branch `main` |
-| auditthis | `/plugin install auditthis@jposluns` | versioned zip from auditthis.ai |
+The checksums table under "Checksums" below names every plugin in the list.
+The `marketplace-check` job keeps that table equal to the list, so this README
+holds no other table of plugins. The name of a plugin in that table is the
+`<project>` of the install line above.
 
 secureconfig is held in the list under owner decision D-165. It installs from
 the `main` branch of its repository, so it is the one entry that is not pinned
@@ -44,17 +44,23 @@ The checker checks that:
 - the list is valid, the marketplace name is `jposluns`, the owner name is
   `Jeff Posluns`, and each plugin name is used once;
 - the top level of the list holds only `name`, `owner`, `description`,
-  `metadata` and `plugins`, and `metadata` holds only `description` and
-  `version`, so that a pull request cannot add a field that no check judges;
+  `metadata` and `plugins`, `owner` holds only `name`, `email` and `url`, and
+  `metadata` holds only `description` and `version`, so that a pull request
+  cannot add a field that no check judges;
 - an entry holds only `name`, `description` and `source`, so that it cannot
   carry plugin parts of its own, which no SHA-256 here would cover;
 - every entry is a zip source; a repository source is refused, pinned or not
   (owner ruling D-164). The one exception is an entry that the checker's
   `HELD_ENTRIES` table names field for field (owner decision D-165); the
-  Plugins section above names every held entry;
+  checksums table below lists every held entry as not pinned;
 - a zip source is an https URL on a known host, its file name is
-  `<artifact>-<version>.zip`, and its SHA-256 matches the one `release` row for
-  that artifact and version at https://posluns.dev/hashes.txt;
+  `<entry name>-plugin-<version>.zip`, and its SHA-256 matches the one
+  `release` row for that artifact and version at
+  https://posluns.dev/hashes.txt. The file name ties an entry to its project:
+  the `auditthis` entry cannot point at the zip of another project;
+- compared with the list on `main`, no entry is removed or renamed, the zip of
+  an entry stays on the host that it has on `main`, and its version is not
+  lower than the version on `main`. A new entry may use any known host;
 - the checksums table in this README and the `SHA256SUMS` file match the list.
 
 The job passes only when the pull request changes
@@ -63,6 +69,11 @@ The job passes only when the pull request changes
 job fails for it, and
 `.github/CODEOWNERS` names the owner as the required reviewer for `.github/`,
 `tools/` and the `CODEOWNERS` file itself.
+
+Removing or renaming an entry, moving an entry to another host and going back
+to an earlier version need the owner's review too: the job fails for each of
+them. The `main-check` job has no earlier list to compare with, so it does not
+apply these three rules.
 
 The job judges a pull request against `main` as it was when the job started,
 and nothing starts it again when `main` changes. So a pull request is merged
@@ -73,6 +84,31 @@ together with "Require branches to be up to date before merging"; without that
 setting it is a step for whoever merges. The `main-check` job runs the same
 checker on `main` after each push to it, and fails when `main` holds a list,
 a checksums table or a `SHA256SUMS` that the checker refuses.
+
+The job takes its workflow and checker from the base branch of the pull
+request. A branch other than `main` can hold an older check, so a pull request
+against such a branch can pass a check that `main` would fail. Nothing in this
+repository can stop that. The repository administrator must:
+
+- keep `main` the only branch whose `marketplace-check` result is accepted.
+  The simple way is to delete every other branch and to allow no new one;
+- require the `marketplace-check` job on `main`.
+
+The workflow also runs when a pull request is edited, so that a pull request
+whose base branch is changed to `main` is checked again, by the check of
+`main`. The next three statements are inferences about GitHub's behaviour.
+They have not been tested on this repository:
+
+- GitHub records a job result for the last commit of a pull request, so a
+  result from a run against another branch could count for `main`;
+- changing the base branch of a pull request starts the `edited` run;
+- the result of that run replaces the earlier result for the same commit.
+
+The workflow names the two actions that it uses, `actions/checkout` and
+`actions/setup-python`, by version tag and not by commit. This is left as it
+is for now: the owner will pin both to commit SHAs (TODO 61). Until then,
+whoever can move those tags can change what the job runs. The job's token can
+read the repository's contents and nothing more, and the job uses no secret.
 
 The hashes list holds one digest for each release. What the digest covers
 depends on the project. For some projects it is the SHA-256 of the release zip.

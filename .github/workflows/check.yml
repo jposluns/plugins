@@ -16,13 +16,21 @@ name: Marketplace check
 # The branch protection of main must therefore require this check together
 # with "Require branches to be up to date before merging" (see the README).
 #
+# The "edited" type is in the list for a pull request whose base branch is
+# changed: the run then starts again, with the workflow and the checker of the
+# new base branch. This is an inference about GitHub's behaviour and has not
+# been tested on this repository. "edited" also starts a run when only the
+# title or the text of the pull request changes; that run repeats the check.
+# A branch other than main can hold an older check, so main must be the only
+# branch whose marketplace-check result is accepted (see the README).
+#
 # The main-check job runs on a push to main. It runs main's own checker on
 # main's own files. It cannot stop a merge; it shows a main that its own
 # checker refuses.
 
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, edited]
   push:
     branches: [main]
 
@@ -88,12 +96,15 @@ jobs:
           done
 
       # pr-file-1 is the pull request's marketplace.json, pr-file-2 its
-      # README.md and pr-file-3 its SHA256SUMS. README.md with no folder is the
-      # base branch's own file, from the work tree.
+      # README.md and pr-file-3 its SHA256SUMS. README.md with no folder and
+      # .claude-plugin/marketplace.json are the base branch's own files, from
+      # the work tree. With --base the checker refuses a removed or renamed
+      # entry, another host for an entry and a lower version of an entry.
       - name: Check the pull request's marketplace.json, README.md and SHA256SUMS
         shell: bash
         run: |
           python3 -I -B tools/check_marketplace.py "${RUNNER_TEMP}/pr-file-1" \
+            --base .claude-plugin/marketplace.json \
             --readme "${RUNNER_TEMP}/pr-file-2" --readme-base README.md \
             --sums-file "${RUNNER_TEMP}/pr-file-3"
 

@@ -12,7 +12,8 @@ Options for a check: --hashes-file FILE reads the hashes list from a local
 file. --readme FILE, --readme-base FILE and --sums-file FILE check the
 checksums of rule 8 in those files. --print-checksums prints the checksums of
 a file that passes, to paste into README.md and SHA256SUMS; the checker never
-writes a file.
+writes a file. --base FILE names the base branch's marketplace.json and turns
+on rule 12; the pull request job passes it.
 
 What it checks:
 
@@ -49,18 +50,32 @@ What it checks:
      field is refused, so that an entry cannot carry plugin parts of its own
      (for example hooks or servers) that the sha256 of the zip does not cover.
  10. The top level holds only the fields name, owner, description, metadata
-     and plugins. metadata is an object that holds only description and
-     version, both text. Any other field is refused, so that a pull request
-     cannot add a field that no rule here judges.
+     and plugins. owner holds only name, email and url. metadata is an object
+     that holds only description and version, both text. Any other field is
+     refused, so that a pull request cannot add a field that no rule here
+     judges.
+ 11. An archive entry is tied to its project by its name: the artifact in the
+     zip file name is the entry name followed by "-plugin". The entry
+     auditthis takes auditthis-plugin-<version>.zip, and no other project's
+     zip.
+ 12. With --base FILE, the file is compared with the base branch's file.
+     Every entry name of the base file is still in the file, so an entry is
+     not removed or renamed. For an archive entry that is also an archive
+     entry in the base file, the url host equals the base entry's host, and
+     the version is not lower than the base entry's version. Two versions
+     that differ must both be numbers with "." between them; 1.0 equals
+     1.0.0. A new entry may use any allow-listed host. Without --base none of
+     this is checked: the check of main after a merge has no base file.
 
 What it does not check: it does not download a zip or clone a repository, so
 it does not compare the entry name with the plugin's own plugin.json, and it
 does not run "claude plugin validate". It does not check that the file has
 its own row in hashes.txt; that row is added after the change is merged. It
-finds a zip's row by the artifact and version in the file name alone. It does
-not know what a project's digest covers (the head of hashes.txt says), so it
-does not refuse, by name, a zip named after a project whose digest covers
-another file; the sha256 must still equal the row's.
+finds a zip's row by the artifact and version in the file name alone; rule 11
+ties the artifact to the entry name. It does not know what a project's digest
+covers (the head of hashes.txt says), so it does not refuse a row whose
+digest covers another file than the zip; the sha256 must still equal the
+row's. Rule 12 compares the host of a url with the base file, not its path.
 
 Any failure to read a file or to fetch hashes.txt counts as a problem.
 Exit status: 0 when clean, 1 when there are problems, 2 for a usage error.
@@ -142,6 +157,17 @@ TOP_FIELDS = frozenset({"name", "owner", "description", "metadata", "plugins"})
 TOP_FIELDS_PROBLEM = "the top level holds only name, owner, description, metadata and plugins"
 METADATA_FIELDS = frozenset({"description", "version"})
 METADATA_FIELDS_PROBLEM = '"metadata" holds only description and version'
+OWNER_FIELDS = frozenset({"name", "email", "url"})
+OWNER_FIELDS_PROBLEM = '"owner" holds only name, email and url'
+# Rule 11: the artifact of an entry's zip is the entry name followed by this
+# text, so that an entry cannot point at another project's zip.
+ARTIFACT_SUFFIX = "-plugin"
+# Rule 12: the comparison with the base branch's file (--base). The base file
+# is not judged here; it must still be a list that can be compared with.
+BASE_PROBLEM = ("base: the base branch's marketplace file is not a list whose entries each "
+                "have a name of their own, so the file could not be compared with it")
+BASE_REMOVED_PROBLEM = ("base: the entry {!r} of the base branch is not in the file; an entry "
+                        "is not removed or renamed without the owner's review")
 
 # Owner ruling D-164: the checksums that README.md and SHA256SUMS list.
 CATALOGUE_NAME = ".claude-plugin/marketplace.json"
@@ -156,6 +182,7 @@ REF_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/+-]*")
 REPO_RE = re.compile(r"jposluns/([A-Za-z0-9._-]+)")
 REPO_URL_RE = re.compile(r"https://github\.com/jposluns/([A-Za-z0-9._-]+?)(?:\.git)?")
 ZIP_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\.zip")
+VERSION_RE = re.compile(r"[0-9]+(?:\.[0-9]+)*")  # a version that rule 12 can put in order
 URL_CHARS_RE = re.compile(r"[!-$&-\[\]-~]+")  # printable ASCII without space, % and backslash
 HASHES_DIGEST_RE = re.compile(r"sha256:([0-9a-f]{64})")
 HASHES_RELEASE_KIND = "release"
@@ -379,15 +406,93 @@ def check_archive_url(url):
     return file_name, None
 
 
-def _check_archive(source, label, problems, hashes):
+def _version_key(version):
+    """Return a key that puts versions in order, or None for a version with no order.
+
+    A version has an order when it is numbers with "." between them. Each
+    number counts as a number, whatever its length: 2.9.0 is lower than
+    2.10.0. Zeros at the end do not count: 1.0 equals 1.0.0.
+    """
+    if not VERSION_RE.fullmatch(version):
+        return None
+    key = [(len(part.lstrip("0")), part.lstrip("0")) for part in version.split(".")]
+    while key and key[-1] == (0, ""):
+        key.pop()
+    return key
+
+
+def _base_entries(base_raw):
+    """Return ({entry name: entry}, None) or (None, problem) for the base branch's file.
+
+    Every entry must be an object with a text name that no other entry uses,
+    or nothing can be compared with the file (rule 12).
+    """
+    document, problem = _parse_json(base_raw)
+    plugins = None if problem or not isinstance(document, dict) else document.get("plugins")
+    if not isinstance(plugins, list):
+        return None, BASE_PROBLEM
+    entries = {}
+    for entry in plugins:
+        name = entry.get("name") if isinstance(entry, dict) else None
+        if not isinstance(name, str) or name in entries:
+            return None, BASE_PROBLEM
+        entries[name] = entry
+    return entries, None
+
+
+def _compare_with_base(url, version, base):
+    """Return the rule 12 problems of an archive url and its version against a base entry.
+
+    base is the base branch's entry of the same name, or None. An entry that
+    is new, or that was not an archive entry in the base file, has nothing to
+    be compared with: rule 6 holds its host to the allow-list.
+    """
+    base_source = base.get("source") if isinstance(base, dict) else None
+    if not isinstance(base_source, dict) or base_source.get("source") != PINNED_SOURCE:
+        return []
+    file_name, url_problem = check_archive_url(base_source.get("url"))
+    named = None if url_problem else split_archive_name(file_name)
+    if not named:
+        return ["the base branch's entry of this name has an archive url that cannot be read, "
+                "so the host and the version could not be compared with it"]
+    problems = []
+    host = urllib.parse.urlsplit(url).netloc
+    base_host = urllib.parse.urlsplit(base_source["url"]).netloc
+    if host != base_host:
+        problems.append('"url" host {!r} is not the host of this entry on the base branch, '
+                        '{!r}; an entry stays on its host'.format(host, base_host))
+    key, base_key = _version_key(version), _version_key(named[1])
+    if version == named[1]:
+        pass
+    elif key is None or base_key is None:
+        problems.append("version {} cannot be compared with the base branch's version {}: "
+                        'both must be numbers with "." between them'.format(version, named[1]))
+    elif key < base_key:
+        problems.append("version {} is lower than the base branch's version {}; an entry does "
+                        "not go back to an earlier version".format(version, named[1]))
+    return problems
+
+
+def _check_archive(source, label, problems, hashes, name=None, base=None):
+    """Check an archive source.
+
+    name is the entry name when it is in the accepted form, else None (rule
+    11). base is the base branch's entry of that name, or None (rule 12).
+    """
     file_name, url_problem = check_archive_url(source.get("url"))
     named = None if url_problem else split_archive_name(file_name)
     if not url_problem and not named:
         url_problem = ('"url" file name {} is not of the form <artifact>-<version>.zip (the '
                        'version is the last part after a "-" and starts with a digit)'.format(
                            file_name))
+    if not url_problem and name is not None and named[0] != name + ARTIFACT_SUFFIX:
+        url_problem = ('"url" file name {0} must be {1}{2}-<version>.zip: the artifact is the '
+                       'entry name followed by "{2}"'.format(file_name, name, ARTIFACT_SUFFIX))
     if url_problem:
         problems.append("{}: {}".format(label, url_problem))
+    else:
+        problems.extend("{}: {}".format(label, text)
+                        for text in _compare_with_base(source["url"], named[1], base))
     sha256 = source.get("sha256")
     sha_ok = isinstance(sha256, str) and bool(SHA256_RE.fullmatch(sha256))
     if not sha_ok:
@@ -427,7 +532,7 @@ def _is_held(entry):
     return isinstance(name, str) and name in HELD_ENTRIES and entry == HELD_ENTRIES[name]
 
 
-def _check_source(source, label, problems, notes, hashes, held=False):
+def _check_source(source, label, problems, notes, hashes, held=False, name=None, base=None):
     if isinstance(source, str):
         problems.append("{}: a relative path source is not accepted; use an archive "
                         "source".format(label))
@@ -458,7 +563,7 @@ def _check_source(source, label, problems, notes, hashes, held=False):
             problems.append("{}: {}".format(label, path_problem))
         _check_pin(source, label, problems, notes)
     else:
-        _check_archive(source, label, problems, hashes)
+        _check_archive(source, label, problems, hashes, name, base)
     if kind != PINNED_SOURCE and held:
         notes.append("{}: {}: a {} source, not pinned by sha256".format(label, HELD_NOTE, kind))
     elif kind != PINNED_SOURCE:
@@ -466,11 +571,13 @@ def _check_source(source, label, problems, notes, hashes, held=False):
                         "hashes.txt (owner ruling D-164)".format(label, kind, D164_PROBLEM))
 
 
-def check_marketplace(raw, load_hashes):
+def check_marketplace(raw, load_hashes, base_raw=None):
     """Check the bytes of a marketplace.json. Returns (problems, notes, plugin count).
 
     load_hashes is called at most once, and only when an archive entry needs it.
-    It returns the text of the hashes list or raises HashesError.
+    It returns the text of the hashes list or raises HashesError. base_raw is
+    the bytes of the base branch's marketplace.json, or None to leave rule 12
+    out.
     """
     problems, notes = [], []
     document, problem = _parse_json(raw)
@@ -496,6 +603,10 @@ def check_marketplace(raw, load_hashes):
         for key in ("email", "url"):
             if key in document["owner"] and not isinstance(document["owner"][key], str):
                 problems.append('"owner.{}" must be text'.format(key))
+        extra = sorted(str(key) for key in set(document["owner"]) - OWNER_FIELDS)
+        if extra:
+            problems.append("{}; field(s) not accepted: {}".format(
+                OWNER_FIELDS_PROBLEM, ", ".join(extra)))
 
     if "description" in document and not isinstance(document["description"], str):
         problems.append('"description" must be text')
@@ -527,6 +638,13 @@ def check_marketplace(raw, load_hashes):
     if not plugins:
         notes.append('"plugins" is empty')
 
+    base_entries = {}
+    if base_raw is not None:
+        base_entries, problem = _base_entries(base_raw)
+        if problem:
+            base_entries = {}
+            problems.append(problem)
+
     hashes = _Hashes(load_hashes)
     seen = set()
     for index, entry in enumerate(plugins):
@@ -535,6 +653,7 @@ def check_marketplace(raw, load_hashes):
             problems.append("{}: an entry must be an object".format(label))
             continue
         name = entry.get("name")
+        tied = None
         if "name" not in entry:
             problems.append('{}: missing required field "name"'.format(label))
         elif not isinstance(name, str) or not NAME_RE.fullmatch(name):
@@ -546,6 +665,7 @@ def check_marketplace(raw, load_hashes):
                 problems.append('{}: the name "{}" is already used by another entry'.format(
                     label, name))
             seen.add(name)
+            tied = name
         extra = sorted(str(key) for key in set(entry) - ENTRY_FIELDS)
         if extra:
             problems.append("{}: {}; field(s) not accepted: {}".format(
@@ -555,7 +675,10 @@ def check_marketplace(raw, load_hashes):
         if "source" not in entry:
             problems.append('{}: missing required field "source"'.format(label))
         else:
-            _check_source(entry["source"], label, problems, notes, hashes, _is_held(entry))
+            _check_source(entry["source"], label, problems, notes, hashes, _is_held(entry),
+                          tied, base_entries.get(tied))
+    problems.extend(BASE_REMOVED_PROBLEM.format(name) for name in base_entries
+                    if name not in seen)
     return problems, notes, len(plugins)
 
 
@@ -709,7 +832,7 @@ def check_checksums(raw, readme=None, readme_base=None, sums_file=None):
 # --------------------------------------------------------------------------
 
 def run_check(path, hashes_file=None, out=None, readme=None, readme_base=None,
-              sums_file=None, print_checksums=False):
+              sums_file=None, print_checksums=False, base=None):
     out = out or sys.stdout
     used = []
 
@@ -728,9 +851,12 @@ def run_check(path, hashes_file=None, out=None, readme=None, readme_base=None,
     except OSError as error:
         problems, notes, count = ["could not read the file: {}".format(error)], [], 0
     else:
-        problems, notes, count = check_marketplace(raw, load_hashes)
+        base_raw, base_problem = (None, None) if base is None else _read_small(base, "base")
+        problems, notes, count = check_marketplace(raw, load_hashes, base_raw)
+        problems.extend([base_problem] if base_problem else [])
         problems.extend(check_checksums(raw, readme, readme_base, sums_file))
-        compared = (("readme", readme), ("base readme", readme_base), ("sums file", sums_file))
+        compared = (("base list", base), ("readme", readme), ("base readme", readme_base),
+                    ("sums file", sums_file))
         if print_checksums and not problems and checksum_block(raw) is None:
             problems.append("the checksums could not be made from the file")
     for source in used:
@@ -762,6 +888,9 @@ def main(argv=None):
                         help="marketplace.json to check (default: the one in this repository)")
     parser.add_argument("--hashes-file", metavar="FILE",
                         help="read the hashes list from a local file instead of fetching it")
+    parser.add_argument("--base", metavar="FILE",
+                        help="the base branch's marketplace.json: refuse a removed or renamed "
+                             "entry, another host for an entry and a lower version (rule 12)")
     parser.add_argument("--readme", metavar="FILE",
                         help="check the checksums block of this README against the file")
     parser.add_argument("--readme-base", metavar="FILE",
@@ -777,7 +906,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     checked = args.readme or args.readme_base or args.sums_file
     if args.self_test:
-        if args.path or args.hashes_file or checked or args.print_checksums:
+        if args.path or args.hashes_file or checked or args.print_checksums or args.base:
             parser.error("--self-test takes no other argument")
         return self_test()
     if args.readme_base and not args.readme:
@@ -790,7 +919,7 @@ def main(argv=None):
         readme, sums_file = readme or DEFAULT_README, sums_file or DEFAULT_SUMS
     return run_check(args.path or DEFAULT_PATH, args.hashes_file, readme=readme,
                      readme_base=args.readme_base, sums_file=sums_file,
-                     print_checksums=args.print_checksums)
+                     print_checksums=args.print_checksums, base=args.base)
 
 
 # --------------------------------------------------------------------------
@@ -853,11 +982,13 @@ _SAMPLE_SHA_2_13_0 = "78af137b72da1b7a4ef521d26aaeed42e5e53288463c660368f774a7d1
 _SAMPLE_SHA_SKILL = "2d984a4041976c81cf0fc7999fe933a9851d67fb1a53f82d4b5000ae89d1f1de"
 _SAMPLE_PRE_URL = "https://aiqt.ai/downloads/aiqt-1.0.0.zip"
 _SAMPLE_PRE_SHA = "435cb9659316125701b1479a35da4be74ac4a6b62c6530cfaff1c5bb31e229dc"
+_SAMPLE_URL_2_13_0 = "https://auditthis.ai/downloads/auditthis-plugin-2.13.0.zip"
+_SAMPLE_SKILL_URL = "https://auditthis.ai/downloads/auditthis-skill-2.14.0.zip"
 
 
-def _sample(url=_SAMPLE_URL, sha256=_SAMPLE_SHA):
-    """The fixture with its entry replaced by the auditthis entry."""
-    return _changed(("plugins", _ENTRY), {"name": "auditthis", "source": {
+def _sample(url=_SAMPLE_URL, sha256=_SAMPLE_SHA, name="auditthis"):
+    """The fixture with its entry replaced by the auditthis entry, or one of another name."""
+    return _changed(("plugins", _ENTRY), {"name": name, "source": {
         "source": "archive", "url": url, "sha256": sha256}})
 
 
@@ -874,11 +1005,11 @@ def _fixture():
     }
 
 
-def _second(name="delta"):
+def _second(name="other", url=_OTHER_URL, sha256=_SHA_B):
     """The fixture with a second archive entry, which also has its row in _HASHES."""
     document = _fixture()
     document["plugins"].append({"name": name, "source": {
-        "source": "archive", "url": _OTHER_URL, "sha256": _SHA_B}})
+        "source": "archive", "url": url, "sha256": sha256}})
     return document
 
 
@@ -913,8 +1044,10 @@ def self_test():
     def record(name, passed, detail=""):
         results.append((name, bool(passed), detail))
 
-    def run(document, hashes=_HASHES):
+    def run(document, hashes=_HASHES, base=None):
         raw = document if isinstance(document, bytes) else json.dumps(document).encode("utf-8")
+        if base is not None and not isinstance(base, bytes):
+            base = json.dumps(base).encode("utf-8")
         calls = []
 
         def load():
@@ -923,11 +1056,11 @@ def self_test():
                 raise hashes
             return hashes
 
-        problems, notes, _count = check_marketplace(raw, load)
+        problems, notes, _count = check_marketplace(raw, load, base)
         return problems, notes, len(calls)
 
-    def clean(name, document, hashes=_HASHES, lookups=None, note=None):
-        problems, notes, calls = run(document, hashes)
+    def clean(name, document, hashes=_HASHES, lookups=None, note=None, base=None):
+        problems, notes, calls = run(document, hashes, base)
         passed = not problems
         if lookups is not None:
             passed = passed and calls == lookups
@@ -936,9 +1069,9 @@ def self_test():
         record("accepts " + name, passed,
                "problems={} notes={} lookups={}".format(problems, notes, calls))
 
-    def refused(name, document, fragment, hashes=_HASHES, d164=0):
+    def refused(name, document, fragment, hashes=_HASHES, d164=0, base=None):
         """One problem that holds the fragment, and d164 problems of owner ruling D-164."""
-        problems, _notes, _calls = run(document, hashes)
+        problems, _notes, _calls = run(document, hashes, base)
         ruled = [text for text in problems if D164_PROBLEM in text]
         other = [text for text in problems if D164_PROBLEM not in text]
         record("refuses " + name,
@@ -1048,12 +1181,31 @@ def self_test():
                len(problems) == 2 and "owner.name" in problems[0]
                and "owner.email" in problems[1], repr(problems))
 
+        # Rule 10: owner holds only name, email and url.
+        record("the accepted owner fields are name, email and url",
+               OWNER_FIELDS == {"name", "email", "url"}, repr(sorted(OWNER_FIELDS)))
+        clean("an owner with a name, an email and a url", _changed(("owner",), {
+            "name": OWNER_NAME, "email": "owner@example.test", "url": "https://posluns.dev"}))
+        for field, value in (("hooks", {}), ("Name", OWNER_NAME), ("plugins", []),
+                             ("homepage", "https://posluns.dev"), ("x", None)):
+            refused("the owner field {!r}".format(field), _changed(("owner", field), value),
+                    '"owner" holds only name, email and url; field(s) not accepted: ' + field)
+        refused("two owner fields that are not accepted, as one problem that names both",
+                _changed(("owner",), {"name": OWNER_NAME, "x": 1, "hooks": {}}),
+                "field(s) not accepted: hooks, x")
+        document = _changed(("owner", "x"), 1)
+        document["x"] = 1
+        problems, _notes, _calls = run(document)
+        record("reports the same field in the owner and at the top level as two problems",
+               len(problems) == 2 and problems[0].startswith('"owner" holds only')
+               and problems[1].startswith("the top level holds only"), repr(problems))
+
         # Names.
         for bad in ("Alpha", "al pha", "alpha_1", "-alpha", "alpha-", "alpha--one", "alpha.one",
                     "", 7):
             refused("the entry name {!r}".format(bad), _changed(entry + ("name",), bad),
                     "lowercase letters, digits and single hyphens")
-        refused("a name used twice", _second("beta"), "already used")
+        refused("a name used twice", _second("beta", _ZIP_URL, _SHA_A), "already used")
 
         # Source types and fields.
         refused("a relative path source", _changed(source, "./plugins/alpha"), "relative path")
@@ -1080,7 +1232,7 @@ def self_test():
         document = _second()
         document["plugins"][1]["strict"] = False
         refused("an entry field that is not accepted in the second entry", document,
-                "plugins[1] (delta): an entry holds only")
+                "plugins[1] (other): an entry holds only")
         document = git()
         document["plugins"][_ENTRY]["hooks"] = {}
         refused("an entry field that is not accepted in a git-subdir entry, as two problems",
@@ -1299,6 +1451,40 @@ def self_test():
             got = split_archive_name(name)
             record("file name {} gives {}".format(name, wanted), got == wanted, repr(got))
 
+        # Rule 11: the artifact in the zip file name is the entry name and "-plugin".
+        record('the artifact of an entry is its name followed by "-plugin"',
+               ARTIFACT_SUFFIX == "-plugin", repr(ARTIFACT_SUFFIX))
+        tied = "must be beta-plugin-<version>.zip"
+        for name in ("gamma-plugin-1.0.0.zip", "beta-1.0.0.zip", "beta-skill-1.0.0.zip",
+                     "beta-plugin-x-1.0.0.zip", "xbeta-plugin-1.0.0.zip",
+                     "Beta-plugin-1.0.0.zip", "beta_plugin-1.0.0.zip", "plugin-1.0.0.zip"):
+            refused("the zip {} under the entry name beta, even with a row of its own that "
+                    "holds the entry's sha256".format(name),
+                    _changed(source + ("url",), "https://posluns.dev/downloads/" + name), tied,
+                    hashes=_HASHES + _row(split_archive_name(name)[0], "1.0.0", _SHA_A))
+        problems, _notes, calls = run(_changed(source, {
+            "source": "archive", "url": _OTHER_URL, "sha256": _SHA_B}))
+        record("refuses the zip and sha256 of another entry under the entry name beta, with no "
+               "hashes lookup", len(problems) == 1 and tied in problems[0] and calls == 0,
+               repr((problems, calls)))
+        clean("an entry name with a hyphen and a digit, with the zip of that name",
+              _changed(entry, {"name": "tool-2", "source": {
+                  "source": "archive", "url": "https://posluns.dev/tool-2-plugin-1.0.zip",
+                  "sha256": _SHA_A}}),
+              hashes=_row("tool-2-plugin", "1.0", _SHA_A), lookups=1)
+        refused("the entry name beta-plugin with the zip of beta",
+                _changed(entry + ("name",), "beta-plugin"),
+                "must be beta-plugin-plugin-<version>.zip")
+        refused("the published auditthis-skill 2.14.0 zip and sha256 under the entry name "
+                "auditthis", _sample(url=_SAMPLE_SKILL_URL, sha256=_SAMPLE_SHA_SKILL),
+                "must be auditthis-plugin-<version>.zip", hashes=_SAMPLE)
+        refused("the published aiqt 1.0.0 zip and sha256 under the entry name auditthis",
+                _sample(url=_SAMPLE_PRE_URL, sha256=_SAMPLE_PRE_SHA),
+                "must be auditthis-plugin-<version>.zip", hashes=_SAMPLE)
+        refused("the published aiqt 1.0.0 zip under the entry name aiqt: the artifact is not "
+                "aiqt-plugin", _sample(url=_SAMPLE_PRE_URL, sha256=_SAMPLE_PRE_SHA, name="aiqt"),
+                "must be aiqt-plugin-<version>.zip", hashes=_SAMPLE)
+
         # hashes.txt lookups, with rows copied from the published list.
         clean("the auditthis-plugin 2.14.0 entry with the published rows", _sample(),
               hashes=_SAMPLE, lookups=1)
@@ -1317,9 +1503,9 @@ def self_test():
                 _sample(), "no release row for auditthis-plugin 2.14.0",
                 hashes=_SAMPLE.replace(
                     _SAMPLE_ROW, _SAMPLE_ROW.replace("  release      ", "  pre-release  ")))
-        refused("a pre-release row only: the published aiqt 1.0.0 row",
-                _sample(url=_SAMPLE_PRE_URL, sha256=_SAMPLE_PRE_SHA),
-                "no release row for aiqt 1.0.0", hashes=_SAMPLE)
+        got = rows_for_release(_SAMPLE, "aiqt", "1.0.0")
+        record("a pre-release row only: the published aiqt 1.0.0 row gives no release digest",
+               got == ([], ["pre-release"]), repr(got))
         refused("two matching rows: the auditthis-plugin 2.14.0 row twice",
                 _sample(), "2 release rows for auditthis-plugin 2.14.0",
                 hashes=_SAMPLE + _SAMPLE_ROW + "\n")
@@ -1356,6 +1542,136 @@ def self_test():
             refused("a row " + label, _fixture(), "is not in the form", hashes=row)
         refused("a failed hashes lookup", _fixture(), "could not check the sha256",
                 hashes=HashesError("lookup failed"))
+
+        # Rule 12: the comparison with the base branch's file, with the published rows.
+        lower = "is lower than the base branch's version"
+        clean("a file that equals its base file", _sample(), hashes=_SAMPLE, lookups=1,
+              base=_sample())
+        clean("a later version than the base file's", _sample(), hashes=_SAMPLE,
+              base=_sample(_SAMPLE_URL_2_13_0, _SAMPLE_SHA_2_13_0))
+        refused("an earlier version than the base file's, with the sha256 of its own row",
+                _sample(_SAMPLE_URL_2_13_0, _SAMPLE_SHA_2_13_0),
+                "version 2.13.0 " + lower + " 2.14.0", hashes=_SAMPLE, base=_sample())
+        clean("that earlier version when no base file is given",
+              _sample(_SAMPLE_URL_2_13_0, _SAMPLE_SHA_2_13_0), hashes=_SAMPLE)
+
+        # Rule 12: the order of versions.
+        for low, high in (("2.9.0", "2.10.0"), ("2.14.0", "2.14.1"), ("2.14.9", "3"),
+                          ("1.0.15", "1.1"), ("0.9", "1.0"), ("1.0", "1.0.1"), ("1", "1.0.0.1"),
+                          ("09", "10")):
+            keys = _version_key(low), _version_key(high)
+            record("version {} is lower than {}".format(low, high),
+                   None not in keys and keys[0] < keys[1] and not keys[1] < keys[0], repr(keys))
+        keys = _version_key("9" * 5000), _version_key("1" + "0" * 5000)
+        record("a version number of 5000 digits is lower than one of 5001 digits",
+               None not in keys and keys[0] < keys[1], "the keys are not in that order")
+        for one, other in (("1.0", "1.0.0"), ("1.01", "1.1"), ("0", "0.0"), ("2.14.0", "2.14.0")):
+            keys = _version_key(one), _version_key(other)
+            record("version {} equals {}".format(one, other),
+                   None not in keys and keys[0] == keys[1], repr(keys))
+        for bad in ("1.0.0b", "1.0rc1", "1..0", "1.", ".1", "1_0", "1.x", "v1", ""):
+            record("version {!r} has no order".format(bad), _version_key(bad) is None,
+                   repr(_version_key(bad)))
+
+        # Rule 12: the comparison with the base branch's file, with made-up rows.
+        def beta(version, host="posluns.dev"):
+            """The fixture with another version or host for its zip."""
+            return _changed(source + ("url",), "https://{}/downloads/beta-plugin-{}.zip".format(
+                host, version))
+
+        rows = _HASHES + "".join(_row("beta-plugin", version, _SHA_A)
+                                 for version in ("0.9.0", "1.0", "1.0.0b", "2.0.0"))
+        another_host = "is not the host of this entry on the base branch"
+        no_order = "cannot be compared with the base branch's version"
+        clean("version 2.0.0 after the base file's 1.0.0", beta("2.0.0"), hashes=rows,
+              base=_fixture())
+        clean("version 1.0 after the base file's 1.0.0, which it equals", beta("1.0"),
+              hashes=rows, base=_fixture())
+        refused("version 0.9.0 after the base file's 1.0.0", beta("0.9.0"),
+                "version 0.9.0 " + lower + " 1.0.0", hashes=rows, base=_fixture())
+        refused("version 1.0.0 after the base file's 2.0.0", _fixture(),
+                "version 1.0.0 " + lower + " 2.0.0", base=beta("2.0.0"))
+        refused("a version with no order after the base file's 1.0.0", beta("1.0.0b"),
+                "version 1.0.0b " + no_order + " 1.0.0", hashes=rows, base=_fixture())
+        refused("version 2.0.0 after a base file's version with no order", beta("2.0.0"),
+                "version 2.0.0 " + no_order + " 1.0.0b", hashes=rows, base=beta("1.0.0b"))
+        clean("a version with no order that the base file also names", beta("1.0.0b"),
+              hashes=rows, base=beta("1.0.0b"))
+        for host in sorted(ARCHIVE_HOSTS - {"posluns.dev"}):
+            refused("a move of an entry from posluns.dev to " + host, beta("1.0.0", host),
+                    another_host, base=_fixture())
+        refused("a move of an entry from auditthis.ai to posluns.dev", _fixture(), another_host,
+                base=beta("1.0.0", "auditthis.ai"))
+        problems, _notes, _calls = run(beta("0.9.0", "posluns.ca"), rows, _fixture())
+        record("reports another host and a lower version as two problems",
+               len(problems) == 2 and another_host in problems[0] and lower in problems[1]
+               and all(text.startswith(where + ": ") for text in problems), repr(problems))
+        problems, _notes, _calls = run(_changed(source + ("sha256",), _SHA_B), rows,
+                                       beta("2.0.0"))
+        record("reports a lower version and a wrong sha256 as two problems",
+               len(problems) == 2 and lower in problems[0] and "does not match" in problems[1],
+               repr(problems))
+
+        # Rule 12: new, removed and renamed entries.
+        removed = "of the base branch is not in the file"
+        clean("a new entry on an allow-listed host beside the base file's entry", _second(),
+              lookups=1, base=_fixture())
+        refused("a new entry on a host that is not allow-listed",
+                _second(url="https://evil.example/other-plugin-1.0.0.zip"), "allow-list",
+                base=_fixture())
+        clean("any entry when the base file has no entry", _fixture(),
+              base=_changed(("plugins",), []))
+        refused("a file without an entry of the base file", _fixture(),
+                "base: the entry 'other' " + removed, base=_second())
+        refused("a renamed entry, with the zip of its new name",
+                _changed(entry, {"name": "gamma", "source": {
+                    "source": "archive", "url": "https://posluns.dev/gamma-plugin-1.0.0.zip",
+                    "sha256": _SHA_A}}),
+                "base: the entry 'beta' " + removed,
+                hashes=_row("gamma-plugin", "1.0.0", _SHA_A), base=_fixture())
+        problems, _notes, _calls = run(_changed(("plugins",), []), base=_second())
+        record("reports each entry of the base file that an empty list lacks, in the base "
+               "file's order", len(problems) == 2 and "'beta' " + removed in problems[0]
+               and "'other' " + removed in problems[1], repr(problems))
+        problems, _notes, _calls = run(_changed(entry + ("name",), "Beta"), base=_fixture())
+        record("reports an entry name in another case as a name problem and a removed entry",
+               len(problems) == 2 and "lowercase letters" in problems[0]
+               and "'beta' " + removed in problems[1], repr(problems))
+        document = _second()
+        document["plugins"].reverse()
+        clean("the base file's entries in another order", document, lookups=1, base=_second())
+        only_other = _changed(("plugins",), _second()["plugins"][1:])
+        HELD_ENTRIES = {"beta": held}
+        clean("a held entry that the base file also holds", git(), lookups=0, note=held_note,
+              base=git())
+        clean("an archive entry in place of the base file's held entry", _fixture(), lookups=1,
+              base=git())
+        refused("a file without the base file's held entry", only_other,
+                "base: the entry 'beta' " + removed, base=git())
+        HELD_ENTRIES = {}
+        clean("an archive entry in place of a git-subdir entry of the base file that is not "
+              "held", _fixture(), lookups=1, base=git())
+
+        # Rule 12: a base file that cannot be compared with.
+        for name, base in (
+                ("that is broken JSON", b"{"),
+                ("that is a top-level array", b"[]"),
+                ("that starts with a byte order mark", b"\xef\xbb\xbf" + good),
+                ("with no plugins", _changed(("plugins",))),
+                ("with plugins that is an object", _changed(("plugins",), {})),
+                ("with an entry that is text", _changed(entry, "beta")),
+                ("with an entry without a name", _changed(entry + ("name",))),
+                ("with an entry name that is a number", _changed(entry + ("name",), 7)),
+                ("with a name used twice", _second("beta", _ZIP_URL, _SHA_A))):
+            refused("a base file " + name, _fixture(),
+                    "base: the base branch's marketplace file is not a list", base=base)
+        for name, value in (
+                ("on a host that is not allow-listed", "https://evil.example/" + _ZIP),
+                ("with no version in its file name", "https://posluns.dev/beta-plugin.zip"),
+                ("that is not text", None)):
+            refused("a base entry with an archive url " + name, _fixture(),
+                    where + ": the base branch's entry of this name has an archive url that "
+                    "cannot be read", base=_changed(source + ("url",), value))
 
         # Fetching hashes.txt: status codes and the one allowed redirect.
         def fetch(replies):
@@ -1429,7 +1745,7 @@ def self_test():
                    "| `.claude-plugin/marketplace.json` | the marketplace file | `{}` |".format(
                        digest),
                    "| `beta-plugin-1.0.0.zip` | the `beta` plugin | `{}` |".format(_SHA_A),
-                   "| `other-plugin-1.0.0.zip` | the `delta` plugin | `{}` |".format(_SHA_B),
+                   "| `other-plugin-1.0.0.zip` | the `other` plugin | `{}` |".format(_SHA_B),
                    "<!-- checksums:end -->"], repr(block))
         longer = checksum_block(raw + b"\n")
         record("one more byte in the file changes the block's line for the file, and no other",
@@ -1715,13 +2031,45 @@ def self_test():
                    "SHA256SUMS that it did not compare",
                    got == 1 and "FAIL, 1 problem(s)" in text and "could not read the file" in text
                    and "readme" not in text and "sums file" not in text, repr((got, text)))
+
+            # The command line and the base file (rule 12).
+            base_market = Path(folder) / "marketplace-base.json"
+            with_list = ["--base", str(base_market)]
+            base_market.write_bytes(market.read_bytes())
+            case("passes a file that equals its base file, with the README and SHA256SUMS",
+                 with_list + with_base + with_sums, 0, "OK, 1 plugin(s) checked",
+                 "base list: {}".format(base_market))
+            case("names no base file when none is given", with_base + with_sums, 0,
+                 "OK, 1 plugin(s) checked", without=("base list",))
+            base_market.write_text(json.dumps(_second()), encoding="utf-8")
+            case("fails a file without an entry of its base file",
+                 with_list + with_base + with_sums, 1, "FAIL, 1 problem(s)",
+                 "problem: base: the entry 'other' " + removed)
+            base_market.write_text(json.dumps(beta("2.0.0")), encoding="utf-8")
+            case("fails an earlier version than the base file's", with_list, 1,
+                 "FAIL, 1 problem(s)", "version 1.0.0 " + lower + " 2.0.0")
+            case("passes that file with no base file", [], 0, "OK, 1 plugin(s) checked")
+            base_market.write_text(json.dumps(beta("1.0.0", "posluns.ca")), encoding="utf-8")
+            case("fails another host than the base file's", with_list, 1, "FAIL, 1 problem(s)",
+                 another_host)
+            base_market.write_bytes(b"{")
+            case("fails a base file that is broken JSON", with_list, 1, "FAIL, 1 problem(s)",
+                 "problem: base: the base branch's marketplace file is not a list")
+            case("fails a missing base file", ["--base", absent], 1, "FAIL, 1 problem(s)",
+                 "problem: base: could not read")
+            base_market.write_bytes(b" " * (MAX_TEXT_BYTES + 1))
+            case("fails an oversized base file", with_list, 1, "FAIL, 1 problem(s)",
+                 "problem: base: ", "is larger than")
+            base_market.write_bytes(market.read_bytes())
+            case("prints the checksums of a file that equals its base file",
+                 with_list + ["--print-checksums"], 0, "base list: ", CHECKSUMS_BEGIN)
             for name, arguments in (
                     ("--readme-base without --readme", ["--readme-base", str(base_path)]),
                     ("--print-checksums with --readme", ["--print-checksums"] + with_readme),
                     ("--print-checksums with --sums-file", ["--print-checksums"] + with_sums)):
                 case("refuses " + name, arguments, "usage error 2")
             for option in (["--print-checksums"], with_readme, with_sums,
-                           ["--readme-base", str(base_path)]):
+                           ["--readme-base", str(base_path)], with_list):
                 got, text = call(["--self-test"] + option)
                 record("command line refuses --self-test with " + option[0],
                        got == "usage error 2", repr((got, text)))

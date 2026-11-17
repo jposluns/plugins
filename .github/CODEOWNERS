@@ -1,6 +1,8 @@
 # The owner is the required reviewer for the check, the checker and this file.
-# Entry-only pull requests change only .claude-plugin/marketplace.json, which
-# has no code owner; the marketplace-check job judges them.
+# Entry-only pull requests change only .claude-plugin/marketplace.json, the
+# checksums table in README.md and SHA256SUMS. None of the three has a code
+# owner; the marketplace-check job judges them, and it fails when README.md
+# differs from main's README.md outside the checksums table.
 
 /.github/            @jposluns
 /tools/              @jposluns

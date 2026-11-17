@@ -3,9 +3,16 @@
 
 Python 3 standard library only. Run it from the repository root:
 
-    python3 -I -B tools/check_marketplace.py               check the live file
+    python3 -I -B tools/check_marketplace.py               check the live file, with the
+                                                           repository's README.md and SHA256SUMS
     python3 -I -B tools/check_marketplace.py FILE          check a copy of the file
     python3 -I -B tools/check_marketplace.py --self-test   test the checker (no network)
+
+Options for a check: --hashes-file FILE reads the hashes list from a local
+file. --readme FILE, --readme-base FILE and --sums-file FILE check the
+checksums of rule 8 in those files. --print-checksums prints the checksums of
+a file that passes, to paste into README.md and SHA256SUMS; the checker never
+writes a file.
 
 What it checks:
 
@@ -25,17 +32,43 @@ What it checks:
      https://posluns.dev/hashes.txt must hold exactly one release row for
      that artifact and version, and the row's sha256 must equal the entry's.
      One redirect is allowed, only to https://posluns.ca/hashes.txt.
+  7. Every entry is an archive source (owner ruling D-164). A github or
+     git-subdir source is refused, pinned or not, after rules 4 and 5 have
+     been applied to it. The one exception is an entry that equals a value
+     of HELD_ENTRIES field for field (owner decision D-165): it passes with
+     a note. HELD_ENTRIES is part of this file, so only a reviewed change to
+     the checker can add to it.
+  8. The checksums (owner ruling D-164). README.md holds one checksums block,
+     from the line <!-- checksums:begin --> to the line <!-- checksums:end -->,
+     equal to the block made from the file: the sha256 of the file itself,
+     then the zip file name and sha256 of each entry. A held entry is listed
+     as not pinned. With --readme-base, the README outside the block equals
+     the base README outside its block. SHA256SUMS is the one line
+     "<sha256>  .claude-plugin/marketplace.json".
+  9. An entry holds only the fields name, description and source. Any other
+     field is refused, so that an entry cannot carry plugin parts of its own
+     (for example hooks or servers) that the sha256 of the zip does not cover.
+ 10. The top level holds only the fields name, owner, description, metadata
+     and plugins. metadata is an object that holds only description and
+     version, both text. Any other field is refused, so that a pull request
+     cannot add a field that no rule here judges.
 
 What it does not check: it does not download a zip or clone a repository, so
 it does not compare the entry name with the plugin's own plugin.json, and it
-does not run "claude plugin validate".
+does not run "claude plugin validate". It does not check that the file has
+its own row in hashes.txt; that row is added after the change is merged. It
+finds a zip's row by the artifact and version in the file name alone. It does
+not know what a project's digest covers (the head of hashes.txt says), so it
+does not refuse, by name, a zip named after a project whose digest covers
+another file; the sha256 must still equal the row's.
 
-Any failure to read the file or to fetch hashes.txt counts as a problem.
+Any failure to read a file or to fetch hashes.txt counts as a problem.
 Exit status: 0 when clean, 1 when there are problems, 2 for a usage error.
 """
 
 import argparse
 import contextlib
+import hashlib
 import http.client
 import io
 import json
@@ -67,12 +100,54 @@ MAX_HASHES_BYTES = 4 * 1024 * 1024
 TIMEOUT_SECONDS = 20
 
 DEFAULT_PATH = Path(__file__).resolve().parent.parent / ".claude-plugin" / "marketplace.json"
+DEFAULT_README = DEFAULT_PATH.parent.parent / "README.md"
+DEFAULT_SUMS = DEFAULT_PATH.parent.parent / "SHA256SUMS"
 
 SOURCE_FIELDS = {
     "github": frozenset({"source", "repo", "ref", "sha"}),
     "git-subdir": frozenset({"source", "url", "path", "ref", "sha"}),
     "archive": frozenset({"source", "url", "sha256"}),
 }
+# Owner ruling D-164: every entry is an archive source pinned by sha256. The
+# other source types stay in SOURCE_FIELDS so that rules 4 and 5 still report
+# what is wrong with them; rule 7 then refuses them.
+PINNED_SOURCE = "archive"
+D164_PROBLEM = "every entry must be an archive source pinned by sha256"
+# Owner decision D-165: the entries that rule 7 lets pass, by entry name. An
+# entry is held only when it equals the value here field for field; any other
+# entry of that name is judged by rule 7. The values hold text only, so "=="
+# is exact. A held entry is reported in a note, and in the checksums block as
+# not pinned. Empty means that no entry is held. A hold ends in one owner pull
+# request: it replaces the entry in the list with its archive entry, removes
+# the entry from this table and updates the README and SHA256SUMS.
+HELD_ENTRIES = {
+    "secureconfig": {
+        "name": "secureconfig",
+        "description": "The secureconfig plugin, from the plugin folder of the "
+                       "jposluns/secureconfig repository.",
+        "source": {"source": "git-subdir", "url": "jposluns/secureconfig", "path": "plugin",
+                   "ref": "main"},
+    },
+}
+HELD_NOTE = "held under owner decision D-165"
+# Rule 9: the fields an entry may hold. Without this limit an entry could carry
+# plugin parts of its own, which the sha256 of the zip does not cover.
+ENTRY_FIELDS = frozenset({"name", "description", "source"})
+ENTRY_FIELDS_PROBLEM = "an entry holds only name, description and source"
+# Rule 10: the fields the top level may hold, and the fields of "metadata".
+# "description" is here because the list holds it today; "$schema" is not,
+# because the list does not hold it. Without this limit a pull request that
+# changes only the list could add a top-level field that no rule here judges.
+TOP_FIELDS = frozenset({"name", "owner", "description", "metadata", "plugins"})
+TOP_FIELDS_PROBLEM = "the top level holds only name, owner, description, metadata and plugins"
+METADATA_FIELDS = frozenset({"description", "version"})
+METADATA_FIELDS_PROBLEM = '"metadata" holds only description and version'
+
+# Owner ruling D-164: the checksums that README.md and SHA256SUMS list.
+CATALOGUE_NAME = ".claude-plugin/marketplace.json"
+CHECKSUMS_BEGIN = "<!-- checksums:begin -->"
+CHECKSUMS_END = "<!-- checksums:end -->"
+MAX_TEXT_BYTES = 1024 * 1024
 
 NAME_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -346,18 +421,24 @@ def _check_archive(source, label, problems, hashes):
             label, target))
 
 
-def _check_source(source, label, problems, notes, hashes):
+def _is_held(entry):
+    """True when an entry equals its HELD_ENTRIES value field for field (rule 7)."""
+    name = entry.get("name")
+    return isinstance(name, str) and name in HELD_ENTRIES and entry == HELD_ENTRIES[name]
+
+
+def _check_source(source, label, problems, notes, hashes, held=False):
     if isinstance(source, str):
-        problems.append("{}: a relative path source is not accepted; use github, git-subdir "
-                        "or archive".format(label))
+        problems.append("{}: a relative path source is not accepted; use an archive "
+                        "source".format(label))
         return
     if not isinstance(source, dict):
         problems.append('{}: "source" must be an object'.format(label))
         return
     kind = source.get("source")
     if not isinstance(kind, str) or kind not in SOURCE_FIELDS:
-        problems.append("{}: source type {!r} is not accepted; use github, git-subdir or "
-                        "archive".format(label, kind))
+        problems.append("{}: source type {!r} is not accepted; use an archive "
+                        "source".format(label, kind))
         return
     extra = sorted(str(key) for key in set(source) - SOURCE_FIELDS[kind])
     if extra:
@@ -378,6 +459,11 @@ def _check_source(source, label, problems, notes, hashes):
         _check_pin(source, label, problems, notes)
     else:
         _check_archive(source, label, problems, hashes)
+    if kind != PINNED_SOURCE and held:
+        notes.append("{}: {}: a {} source, not pinned by sha256".format(label, HELD_NOTE, kind))
+    elif kind != PINNED_SOURCE:
+        problems.append("{}: a {} source is not accepted: {} that has a release row in "
+                        "hashes.txt (owner ruling D-164)".format(label, kind, D164_PROBLEM))
 
 
 def check_marketplace(raw, load_hashes):
@@ -414,6 +500,23 @@ def check_marketplace(raw, load_hashes):
     if "description" in document and not isinstance(document["description"], str):
         problems.append('"description" must be text')
 
+    extra = sorted(str(key) for key in set(document) - TOP_FIELDS)
+    if extra:
+        problems.append("{}; field(s) not accepted: {}".format(
+            TOP_FIELDS_PROBLEM, ", ".join(extra)))
+    if "metadata" in document:
+        metadata = document["metadata"]
+        if not isinstance(metadata, dict):
+            problems.append('"metadata" must be an object')
+        else:
+            extra = sorted(str(key) for key in set(metadata) - METADATA_FIELDS)
+            if extra:
+                problems.append("{}; field(s) not accepted: {}".format(
+                    METADATA_FIELDS_PROBLEM, ", ".join(extra)))
+            for key in sorted(METADATA_FIELDS):
+                if key in metadata and not isinstance(metadata[key], str):
+                    problems.append('"metadata.{}" must be text'.format(key))
+
     if "plugins" not in document:
         problems.append('missing required field "plugins"')
         return problems, notes, 0
@@ -443,20 +546,170 @@ def check_marketplace(raw, load_hashes):
                 problems.append('{}: the name "{}" is already used by another entry'.format(
                     label, name))
             seen.add(name)
+        extra = sorted(str(key) for key in set(entry) - ENTRY_FIELDS)
+        if extra:
+            problems.append("{}: {}; field(s) not accepted: {}".format(
+                label, ENTRY_FIELDS_PROBLEM, ", ".join(extra)))
         if "description" in entry and not isinstance(entry["description"], str):
             problems.append('{}: "description" must be text'.format(label))
         if "source" not in entry:
             problems.append('{}: missing required field "source"'.format(label))
         else:
-            _check_source(entry["source"], label, problems, notes, hashes)
+            _check_source(entry["source"], label, problems, notes, hashes, _is_held(entry))
     return problems, notes, len(plugins)
+
+
+# --------------------------------------------------------------------------
+# checksums (owner ruling D-164)
+# --------------------------------------------------------------------------
+
+def checksum_block(raw):
+    """Return the README checksums block for the bytes of a marketplace.json.
+
+    The block is a list of lines: the begin line, a table with the sha256 of
+    the file itself and then the zip file name and sha256 of each entry in the
+    file's order, and the end line. A held entry (HELD_ENTRIES) has no zip, so
+    its line says that it is not pinned. Returns None when the block cannot be
+    made: the file is not valid, or an entry that is not held lacks a name, an
+    archive url or a sha256 in the accepted form. check_marketplace reports a
+    problem for every such file.
+    """
+    document, problem = _parse_json(raw)
+    if problem or not isinstance(document, dict):
+        return None
+    plugins = document.get("plugins")
+    if not isinstance(plugins, list):
+        return None
+    rows = []
+    for entry in plugins:
+        if isinstance(entry, dict) and _is_held(entry):
+            rows.append("| none | the `{}` plugin, {} | not pinned |".format(
+                entry["name"], HELD_NOTE))
+            continue
+        source = entry.get("source") if isinstance(entry, dict) else None
+        if not isinstance(source, dict) or source.get("source") != PINNED_SOURCE:
+            return None
+        name, sha256 = entry.get("name"), source.get("sha256")
+        file_name, url_problem = check_archive_url(source.get("url"))
+        if (url_problem or not isinstance(name, str) or not NAME_RE.fullmatch(name)
+                or not isinstance(sha256, str) or not SHA256_RE.fullmatch(sha256)):
+            return None
+        rows.append("| `{}` | the `{}` plugin | `{}` |".format(file_name, name, sha256))
+    first = "| `{}` | the marketplace file | `{}` |".format(
+        CATALOGUE_NAME, hashlib.sha256(raw).hexdigest())
+    return ([CHECKSUMS_BEGIN, "| File | What it is | SHA-256 |", "|---|---|---|", first]
+            + rows + [CHECKSUMS_END])
+
+
+def sums_line(raw):
+    """Return the one line of SHA256SUMS for the bytes of a marketplace.json."""
+    return "{}  {}\n".format(hashlib.sha256(raw).hexdigest(), CATALOGUE_NAME)
+
+
+def _split_readme(text):
+    """Return (lines before, block lines, lines after) for a README text.
+
+    Returns None unless the text holds the begin line once and the end line
+    once, as whole lines, with the begin line first.
+    """
+    lines = text.split("\n")
+    if lines.count(CHECKSUMS_BEGIN) != 1 or lines.count(CHECKSUMS_END) != 1:
+        return None
+    begin, end = lines.index(CHECKSUMS_BEGIN), lines.index(CHECKSUMS_END)
+    if begin > end:
+        return None
+    return lines[:begin], lines[begin:end + 1], lines[end + 1:]
+
+
+def check_readme(text, block, base_text=None):
+    """Return the problems of a README text against a checksums block.
+
+    With base_text, the README must also equal the base README outside the
+    block, so that a pull request can change the block and nothing else.
+    """
+    parts = _split_readme(text)
+    if parts is None:
+        return ['README: must hold one checksums block: the line "{}" once and, after it, '
+                'the line "{}" once'.format(CHECKSUMS_BEGIN, CHECKSUMS_END)]
+    problems = []
+    if parts[1] != block:
+        problems.append("README: the checksums block does not match the marketplace file; "
+                        "replace it with the block that --print-checksums prints")
+    if base_text is not None:
+        base = _split_readme(base_text)
+        if base is None:
+            problems.append("README: the base README holds no single checksums block to "
+                            "compare with")
+        elif (parts[0], parts[2]) != (base[0], base[2]):
+            problems.append("README: the text outside the checksums block differs from the "
+                            "base README; that change needs the owner's review")
+    return problems
+
+
+def check_sums(body, raw):
+    """Return the problems of the bytes of SHA256SUMS for a marketplace.json."""
+    if body != sums_line(raw).encode("ascii"):
+        return ['SHA256SUMS: must be the one line "<sha256>  {}" for the marketplace file; '
+                "replace it with the line that --print-checksums prints".format(CATALOGUE_NAME)]
+    return []
+
+
+def _read_small(path, what):
+    """Return (bytes, None) or (None, problem) for a small file."""
+    try:
+        with open(path, "rb") as handle:
+            body = handle.read(MAX_TEXT_BYTES + 1)
+    except OSError as error:
+        return None, "{}: could not read {}: {}".format(what, path, error)
+    if len(body) > MAX_TEXT_BYTES:
+        return None, "{}: {} is larger than {} bytes".format(what, path, MAX_TEXT_BYTES)
+    return body, None
+
+
+def _read_text(path, what):
+    """Return (text, None) or (None, problem) for a small UTF-8 file."""
+    body, problem = _read_small(path, what)
+    if problem:
+        return None, problem
+    try:
+        return body.decode("utf-8"), None
+    except UnicodeDecodeError:
+        return None, "{}: {} is not UTF-8".format(what, path)
+
+
+def check_checksums(raw, readme=None, readme_base=None, sums_file=None):
+    """Check README.md and SHA256SUMS against the bytes of a marketplace.json.
+
+    Each argument after raw is a path, or None to leave that check out.
+    Returns the problems. A README is never passed unchecked: when the block
+    cannot be made from the file, that is a problem here too.
+    """
+    problems = []
+    if readme is not None:
+        block = checksum_block(raw)
+        text, problem = _read_text(readme, "README")
+        base_text, base_problem = None, None
+        if readme_base is not None:
+            base_text, base_problem = _read_text(readme_base, "base README")
+        if block is None:
+            problems.append("README: the checksums block was not checked, because the "
+                            "marketplace file has problems")
+        elif problem or base_problem:
+            problems.extend(text for text in (problem, base_problem) if text)
+        else:
+            problems.extend(check_readme(text, block, base_text))
+    if sums_file is not None:
+        body, problem = _read_small(sums_file, "SHA256SUMS")
+        problems.extend([problem] if problem else check_sums(body, raw))
+    return problems
 
 
 # --------------------------------------------------------------------------
 # command line
 # --------------------------------------------------------------------------
 
-def run_check(path, hashes_file=None, out=None):
+def run_check(path, hashes_file=None, out=None, readme=None, readme_base=None,
+              sums_file=None, print_checksums=False):
     out = out or sys.stdout
     used = []
 
@@ -468,6 +721,7 @@ def run_check(path, hashes_file=None, out=None):
         return read_hashes_file(hashes_file)
 
     print("check_marketplace: {}".format(path), file=out)
+    compared = ()
     try:
         with open(path, "rb") as handle:
             raw = handle.read(MAX_MARKETPLACE_BYTES + 1)
@@ -475,8 +729,15 @@ def run_check(path, hashes_file=None, out=None):
         problems, notes, count = ["could not read the file: {}".format(error)], [], 0
     else:
         problems, notes, count = check_marketplace(raw, load_hashes)
+        problems.extend(check_checksums(raw, readme, readme_base, sums_file))
+        compared = (("readme", readme), ("base readme", readme_base), ("sums file", sums_file))
+        if print_checksums and not problems and checksum_block(raw) is None:
+            problems.append("the checksums could not be made from the file")
     for source in used:
         print("hashes source: {}".format(source), file=out)
+    for what, checked in compared:
+        if checked is not None:
+            print("{}: {}".format(what, checked), file=out)
     for note in notes:
         print("note: {}".format(note), file=out)
     for problem in problems:
@@ -485,6 +746,12 @@ def run_check(path, hashes_file=None, out=None):
         print("check_marketplace: FAIL, {} problem(s)".format(len(problems)), file=out)
         return 1
     print("check_marketplace: OK, {} plugin(s) checked".format(count), file=out)
+    if print_checksums:
+        print("checksums block for README.md:", file=out)
+        for line in checksum_block(raw):
+            print(line, file=out)
+        print("line for SHA256SUMS:", file=out)
+        print(sums_line(raw), end="", file=out)
     return 0
 
 
@@ -495,14 +762,35 @@ def main(argv=None):
                         help="marketplace.json to check (default: the one in this repository)")
     parser.add_argument("--hashes-file", metavar="FILE",
                         help="read the hashes list from a local file instead of fetching it")
+    parser.add_argument("--readme", metavar="FILE",
+                        help="check the checksums block of this README against the file")
+    parser.add_argument("--readme-base", metavar="FILE",
+                        help="with --readme: the README must equal this base README outside "
+                             "the checksums block")
+    parser.add_argument("--sums-file", metavar="FILE",
+                        help="check this SHA256SUMS against the file")
+    parser.add_argument("--print-checksums", action="store_true",
+                        help="print the README checksums block and the SHA256SUMS line of a "
+                             "file that passes; README.md and SHA256SUMS are not checked")
     parser.add_argument("--self-test", action="store_true",
                         help="test the checker itself; uses no network")
     args = parser.parse_args(argv)
+    checked = args.readme or args.readme_base or args.sums_file
     if args.self_test:
-        if args.path or args.hashes_file:
+        if args.path or args.hashes_file or checked or args.print_checksums:
             parser.error("--self-test takes no other argument")
         return self_test()
-    return run_check(args.path or DEFAULT_PATH, args.hashes_file)
+    if args.readme_base and not args.readme:
+        parser.error("--readme-base needs --readme")
+    if args.print_checksums and checked:
+        parser.error("--print-checksums takes no --readme, --readme-base or --sums-file")
+    readme, sums_file = args.readme, args.sums_file
+    if args.path is None and not args.print_checksums:
+        # The live file is checked with the repository's own README.md and SHA256SUMS.
+        readme, sums_file = readme or DEFAULT_README, sums_file or DEFAULT_SUMS
+    return run_check(args.path or DEFAULT_PATH, args.hashes_file, readme=readme,
+                     readme_base=args.readme_base, sums_file=sums_file,
+                     print_checksums=args.print_checksums)
 
 
 # --------------------------------------------------------------------------
@@ -514,8 +802,19 @@ _SHA_B = "fedcba9876543210" * 4
 _COMMIT = "0123456789abcdef0123456789abcdef01234567"
 _ZIP = "beta-plugin-1.0.0.zip"
 _ZIP_URL = "https://posluns.dev/downloads/" + _ZIP
-_GIT, _ARCHIVE, _GITHUB = 0, 1, 2
+_ENTRY = 0
 _DROP = object()
+_OTHER_URL = "https://aiqt.ai/other-plugin-1.0.0.zip"
+# Sources that owner ruling D-164 refuses. Rules 4 and 5 still apply to them.
+_GIT_SOURCE = {"source": "git-subdir", "url": "jposluns/alpha", "path": "plugin", "ref": "main"}
+_GITHUB_SOURCE = {"source": "github", "repo": "jposluns/gamma", "ref": "v1.0.0", "sha": _COMMIT}
+# The secureconfig entry of the list before owner ruling D-164.
+_OLD_SECURECONFIG = {
+    "name": "secureconfig",
+    "description": "The secureconfig plugin, from the plugin folder of the "
+                   "jposluns/secureconfig repository.",
+    "source": {"source": "git-subdir", "url": "jposluns/secureconfig", "path": "plugin",
+               "ref": "main"}}
 
 
 def _row(artifact, version, digest, kind="release"):
@@ -557,27 +856,41 @@ _SAMPLE_PRE_SHA = "435cb9659316125701b1479a35da4be74ac4a6b62c6530cfaff1c5bb31e22
 
 
 def _sample(url=_SAMPLE_URL, sha256=_SAMPLE_SHA):
-    """The fixture with its archive entry replaced by the auditthis entry."""
-    return _changed(("plugins", _ARCHIVE), {"name": "auditthis", "source": {
+    """The fixture with its entry replaced by the auditthis entry."""
+    return _changed(("plugins", _ENTRY), {"name": "auditthis", "source": {
         "source": "archive", "url": url, "sha256": sha256}})
 
 
 def _fixture():
+    """A file that passes: one archive entry, with its row in _HASHES."""
     return {
         "name": "jposluns",
         "owner": {"name": "Jeff Posluns"},
         "description": "Self-test fixture.",
         "plugins": [
-            {"name": "alpha", "description": "Fixture entry.",
-             "source": {"source": "git-subdir", "url": "jposluns/alpha", "path": "plugin",
-                        "ref": "main"}},
-            {"name": "beta",
+            {"name": "beta", "description": "Fixture entry.",
              "source": {"source": "archive", "url": _ZIP_URL, "sha256": _SHA_A}},
-            {"name": "gamma",
-             "source": {"source": "github", "repo": "jposluns/gamma", "ref": "v1.0.0",
-                        "sha": _COMMIT}},
         ],
     }
+
+
+def _second(name="delta"):
+    """The fixture with a second archive entry, which also has its row in _HASHES."""
+    document = _fixture()
+    document["plugins"].append({"name": name, "source": {
+        "source": "archive", "url": _OTHER_URL, "sha256": _SHA_B}})
+    return document
+
+
+def _with(source, fields):
+    """A copy of a source with fields replaced, or removed when the value is _DROP."""
+    source = dict(source)
+    for key, value in fields.items():
+        if value is _DROP:
+            del source[key]
+        else:
+            source[key] = value
+    return source
 
 
 def _changed(path, value=_DROP):
@@ -594,7 +907,7 @@ def _changed(path, value=_DROP):
 
 
 def self_test():
-    global _https_get
+    global _https_get, DEFAULT_PATH, DEFAULT_README, DEFAULT_SUMS, HELD_ENTRIES
     results = []
 
     def record(name, passed, detail=""):
@@ -623,39 +936,59 @@ def self_test():
         record("accepts " + name, passed,
                "problems={} notes={} lookups={}".format(problems, notes, calls))
 
-    def refused(name, document, fragment, hashes=_HASHES):
+    def refused(name, document, fragment, hashes=_HASHES, d164=0):
+        """One problem that holds the fragment, and d164 problems of owner ruling D-164."""
         problems, _notes, _calls = run(document, hashes)
-        record("refuses " + name, len(problems) == 1 and fragment in problems[0],
-               "wanted one problem holding {!r}, got {}".format(fragment, problems))
+        ruled = [text for text in problems if D164_PROBLEM in text]
+        other = [text for text in problems if D164_PROBLEM not in text]
+        record("refuses " + name,
+               len(other) == 1 and fragment in other[0] and len(ruled) == d164,
+               "wanted one problem holding {!r} and {} D-164 problem(s), got {}".format(
+                   fragment, d164, problems))
+
+    def ruled_out(name, document, labels, hashes=_HASHES, lookups=None, note=None):
+        """Only D-164 problems: one for each label, in the order of the entries."""
+        problems, notes, calls = run(document, hashes)
+        passed = len(problems) == len(labels) and all(
+            text.startswith(label + ": a ") and D164_PROBLEM in text and "D-164" in text
+            for text, label in zip(problems, labels))
+        if lookups is not None:
+            passed = passed and calls == lookups
+        if note is not None:
+            passed = passed and any(note in text for text in notes)
+        record("refuses " + name, passed,
+               "wanted one D-164 problem for each of {}, got problems={} notes={} "
+               "lookups={}".format(labels, problems, notes, calls))
 
     real_get = _https_get
+    real_paths = DEFAULT_PATH, DEFAULT_README, DEFAULT_SUMS
+    real_held = HELD_ENTRIES
 
     def no_network(url):
         raise HashesError("the self-test tried to use the network: {}".format(url))
 
     _https_get = no_network
     try:
-        source = ("plugins", _ARCHIVE, "source")
-        git = ("plugins", _GIT, "source")
-        hub = ("plugins", _GITHUB, "source")
+        # No entry is held, whatever HELD_ENTRIES ships with, except in the
+        # cases for owner decision D-165, which set their own.
+        HELD_ENTRIES = {}
+        entry = ("plugins", _ENTRY)
+        source = entry + ("source",)
+        where = "plugins[0] (beta)"
+
+        def git(**fields):
+            """The fixture with a git-subdir source in place of its archive source."""
+            return _changed(source, _with(_GIT_SOURCE, fields))
+
+        def hub(**fields):
+            """The fixture with a github source in place of its archive source."""
+            return _changed(source, _with(_GITHUB_SOURCE, fields))
 
         # Files that pass.
-        clean("the fixture", _fixture(), lookups=1, note="plugins[0] (alpha): the source is not")
-        document = _fixture()
-        del document["plugins"][_ARCHIVE]
-        clean("a file with no archive entry, without a hashes lookup", document, lookups=0)
-        document = _fixture()
-        document["plugins"].append({"name": "delta", "source": {
-            "source": "archive", "url": "https://aiqt.ai/other-plugin-1.0.0.zip",
-            "sha256": _SHA_B}})
-        clean("two archive entries with one hashes lookup", document, lookups=1)
+        clean("the fixture", _fixture(), lookups=1)
+        clean("two archive entries with one hashes lookup", _second(), lookups=1)
         clean("an empty plugins array, with a note", _changed(("plugins",), []),
               lookups=0, note="empty")
-        clean("a git-subdir https URL with a sha", _changed(git, {
-            "source": "git-subdir", "url": "https://github.com/jposluns/alpha.git",
-            "path": "plugins/alpha", "sha": _COMMIT}))
-        clean("a github source with no ref or sha", _changed(hub, {
-            "source": "github", "repo": "jposluns/gamma"}), note="plugins[2] (gamma)")
         for host in sorted(ARCHIVE_HOSTS):
             clean("an archive on " + host,
                   _changed(source + ("url",), "https://{}/{}".format(host, _ZIP)))
@@ -686,11 +1019,10 @@ def self_test():
         refused("an owner that is text", _changed(("owner",), "Jeff Posluns"), '"owner" must be')
         refused("no plugins", _changed(("plugins",)), 'required field "plugins"')
         refused("plugins that is an object", _changed(("plugins",), {}), "must be an array")
-        refused("an entry that is text", _changed(("plugins", _GIT), "alpha"),
-                "must be an object")
-        refused("an entry without a name", _changed(("plugins", _GIT, "name")),
+        refused("an entry that is text", _changed(entry, "beta"), "must be an object")
+        refused("an entry without a name", _changed(entry + ("name",)),
                 'plugins[0]: missing required field "name"')
-        refused("an entry without a source", _changed(("plugins", _GIT, "source")),
+        refused("an entry without a source", _changed(source),
                 'missing required field "source"')
 
         # The owner name: "Jeff Posluns" exactly.
@@ -719,39 +1051,203 @@ def self_test():
         # Names.
         for bad in ("Alpha", "al pha", "alpha_1", "-alpha", "alpha-", "alpha--one", "alpha.one",
                     "", 7):
-            refused("the entry name {!r}".format(bad), _changed(("plugins", _GIT, "name"), bad),
+            refused("the entry name {!r}".format(bad), _changed(entry + ("name",), bad),
                     "lowercase letters, digits and single hyphens")
-        refused("a name used twice", _changed(("plugins", _GITHUB, "name"), "alpha"),
-                "already used")
+        refused("a name used twice", _second("beta"), "already used")
 
         # Source types and fields.
-        refused("a relative path source", _changed(git, "./plugins/alpha"), "relative path")
+        refused("a relative path source", _changed(source, "./plugins/alpha"), "relative path")
         for kind in ("npm", "url", "command", None, ["github"]):
-            refused("the source type {!r}".format(kind), _changed(git, {"source": kind}),
+            refused("the source type {!r}".format(kind), _changed(source, {"source": kind}),
                     "is not accepted")
         refused("an unknown source field", _changed(source + ("ref",), "main"),
                 "unknown field(s): ref")
 
-        # github and git-subdir sources.
+        # Rule 9: an entry holds only name, description and source.
+        for field, value in (
+                ("hooks", {"PreToolUse": []}), ("mcpServers", {"x": {"command": "x"}}),
+                ("lspServers", {}), ("commands", ["./commands"]), ("agents", "./agents"),
+                ("skills", "./skills"), ("strict", False), ("version", "1.0.0"),
+                ("author", {"name": "x"}), ("homepage", "https://posluns.dev"),
+                ("category", "x"), ("Name", "beta"), ("sha256", _SHA_A), ("x", None)):
+            refused("the entry field {!r}".format(field), _changed(entry + (field,), value),
+                    where + ": an entry holds only name, description and source; field(s) "
+                    "not accepted: " + field)
+        document = _changed(entry + ("hooks",), {})
+        document["plugins"][_ENTRY]["agents"] = []
+        refused("two entry fields that are not accepted, as one problem that names both",
+                document, "field(s) not accepted: agents, hooks")
+        document = _second()
+        document["plugins"][1]["strict"] = False
+        refused("an entry field that is not accepted in the second entry", document,
+                "plugins[1] (delta): an entry holds only")
+        document = git()
+        document["plugins"][_ENTRY]["hooks"] = {}
+        refused("an entry field that is not accepted in a git-subdir entry, as two problems",
+                document, "field(s) not accepted: hooks", d164=1)
+
+        # Rule 10: the top level holds only name, owner, description, metadata and
+        # plugins, and metadata holds only description and version.
+        record("the accepted top-level fields are name, owner, description, metadata and "
+               "plugins", TOP_FIELDS == {"name", "owner", "description", "metadata", "plugins"},
+               repr(sorted(TOP_FIELDS)))
+        record("the accepted metadata fields are description and version",
+               METADATA_FIELDS == {"description", "version"}, repr(sorted(METADATA_FIELDS)))
+        for field, value in (
+                ("$schema", "https://example.test/marketplace.schema.json"),
+                ("version", "1.0.0"), ("hooks", {"PreToolUse": []}),
+                ("mcpServers", {"x": {"command": "x"}}), ("pluginRoot", "./plugins"),
+                ("strict", False), ("Name", "jposluns"), ("Plugins", []), ("x", None)):
+            refused("the top-level field {!r}".format(field), _changed((field,), value),
+                    "the top level holds only name, owner, description, metadata and plugins; "
+                    "field(s) not accepted: " + field)
+        document = _changed(("hooks",), {})
+        document["version"] = "1.0.0"
+        refused("two top-level fields that are not accepted, as one problem that names both",
+                document, "field(s) not accepted: hooks, version")
+        document = _changed(("plugins",))
+        document["hooks"] = {}
+        problems, _notes, _calls = run(document)
+        record("reports a top-level field that is not accepted and no plugins as two problems",
+               len(problems) == 2 and "field(s) not accepted: hooks" in problems[0]
+               and 'required field "plugins"' in problems[1], repr(problems))
+        document = _changed(entry + ("hooks",), {})
+        document["hooks"] = {}
+        problems, _notes, _calls = run(document)
+        record("reports the same field at the top level and in an entry as two problems",
+               len(problems) == 2 and problems[0].startswith("the top level holds only")
+               and problems[1].startswith(where + ": an entry holds only"), repr(problems))
+        refused("a top-level description that is not text", _changed(("description",), 7),
+                '"description" must be text')
+        clean("a file with no top-level description", _changed(("description",)), lookups=1)
+        for name, value in (
+                ("an empty metadata", {}),
+                ("a metadata description", {"description": "Self-test fixture."}),
+                ("a metadata version", {"version": "2"}),
+                ("a metadata description and version",
+                 {"description": "Self-test fixture.", "version": "1.0.0"})):
+            clean(name, _changed(("metadata",), value), lookups=1)
+        for bad in ("1.0.0", 7, None, True, ["version"]):
+            refused("the metadata {!r}".format(bad), _changed(("metadata",), bad),
+                    '"metadata" must be an object')
+        for field, value in (("pluginRoot", "./plugins"), ("hooks", {}), ("Version", "1"),
+                             ("plugins", [])):
+            refused("the metadata field {!r}".format(field),
+                    _changed(("metadata",), {field: value}),
+                    '"metadata" holds only description and version; field(s) not accepted: '
+                    + field)
+        refused("two metadata fields that are not accepted, as one problem that names both",
+                _changed(("metadata",), {"pluginRoot": ".", "hooks": {}, "version": "1"}),
+                "field(s) not accepted: hooks, pluginRoot")
+        for key in ("description", "version"):
+            for bad in (7, None, ["x"], {"x": "y"}):
+                refused("the metadata {} {!r}".format(key, bad),
+                        _changed(("metadata",), {key: bad}),
+                        '"metadata.{}" must be text'.format(key))
+
+        # Owner ruling D-164: every entry is an archive source pinned by sha256.
+        ruled_out("a git-subdir source on a branch, with no hashes lookup and a note that "
+                  "it is not pinned", git(), [where], lookups=0,
+                  note=where + ": the source is not pinned")
+        ruled_out("a git-subdir source pinned to a sha", git(sha=_COMMIT), [where], lookups=0)
+        ruled_out("a git-subdir https URL with a sha and no ref", _changed(source, {
+            "source": "git-subdir", "url": "https://github.com/jposluns/alpha.git",
+            "path": "plugins/alpha", "sha": _COMMIT}), [where])
+        ruled_out("a github source pinned to a tag and a sha", hub(), [where], lookups=0)
+        ruled_out("a github source with no ref or sha, with a note", _changed(source, {
+            "source": "github", "repo": "jposluns/gamma"}), [where], note=where)
+        document = _second()
+        document["plugins"].insert(1, {"name": "alpha", "source": dict(_GIT_SOURCE)})
+        document["plugins"].append({"name": "gamma", "source": dict(_GITHUB_SOURCE)})
+        ruled_out("a git-subdir entry and a github entry among archive entries, which are "
+                  "still looked up", document,
+                  ["plugins[1] (alpha)", "plugins[3] (gamma)"], lookups=1)
+        document = _sample()
+        document["plugins"].insert(0, dict(_OLD_SECURECONFIG))
+        ruled_out("the secureconfig entry of the list before D-164 (git-subdir, branch main, "
+                  "no sha), beside the auditthis entry", document,
+                  ["plugins[0] (secureconfig)"], hashes=_SAMPLE, lookups=1,
+                  note="plugins[0] (secureconfig): the source is not pinned")
+        refused("an archive source with a wrong sha256 beside a git-subdir entry, as two "
+                "problems", document, "does not match the hashes.txt release row",
+                hashes=_SAMPLE.replace(_SAMPLE_SHA, _SAMPLE_SHA_2_13_0), d164=1)
+
+        # Owner decision D-165: an entry that equals a HELD_ENTRIES value field for
+        # field passes rule 7 with a note. Any other entry of that name does not.
+        held = {"name": "beta", "description": "Fixture entry.", "source": dict(_GIT_SOURCE)}
+        held_note = where + ": held under owner decision D-165: a git-subdir source"
+        HELD_ENTRIES = {"beta": held}
+        clean("a held git-subdir entry, with a note and no hashes lookup", git(), lookups=0,
+              note=held_note)
+        clean("an archive entry under a held name", _fixture(), lookups=1)
+        document = _second()
+        document["plugins"][_ENTRY] = dict(held)
+        clean("a held entry beside an archive entry, which is still looked up", document,
+              lookups=1, note=held_note)
+        document = git()
+        document["plugins"].append(dict(held))
+        refused("a held entry twice", document, "already used")
+        for name, document in (
+                ("another ref", git(ref="dev")),
+                ("a sha beside the ref", git(sha=_COMMIT)),
+                ("no ref", git(ref=_DROP)),
+                ("another path", git(path="plugins/beta")),
+                ("the https form of the same repository",
+                 git(url="https://github.com/jposluns/alpha")),
+                ("a github source", hub())):
+            ruled_out("an entry of a held name with " + name, document, [where])
+        document = git()
+        document["plugins"][_ENTRY]["description"] = "Another text."
+        ruled_out("an entry of a held name with another description", document, [where])
+        document = git()
+        del document["plugins"][_ENTRY]["description"]
+        ruled_out("an entry of a held name without its description", document, [where])
+        document = git()
+        document["plugins"][_ENTRY]["name"] = "alpha"
+        ruled_out("a held entry under another name", document, ["plugins[0] (alpha)"])
+        document = git()
+        document["plugins"][_ENTRY]["hooks"] = {}
+        refused("a held entry with one more field, as two problems", document,
+                "field(s) not accepted: hooks", d164=1)
+        HELD_ENTRIES = {"secureconfig": dict(_OLD_SECURECONFIG)}
+        document = _sample()
+        document["plugins"].insert(0, dict(_OLD_SECURECONFIG))
+        clean("the secureconfig entry of the list before D-164 when it is held, beside the "
+              "auditthis entry", document, hashes=_SAMPLE, lookups=1,
+              note="plugins[0] (secureconfig): held under owner decision D-165")
+        HELD_ENTRIES = real_held
+        shipped = []
+        for name, item in sorted(real_held.items()):
+            problems, notes, _calls = run(_changed(("plugins",), [item]))
+            shipped.append((name, problems, item.get("name") == name and not problems
+                            and any(HELD_NOTE in text for text in notes)))
+        record("each entry that HELD_ENTRIES ships with ({}) is held under its own name and "
+               "has no problem".format(", ".join(sorted(real_held)) or "none"),
+               all(passed for _name, _problems, passed in shipped), repr(shipped))
+        HELD_ENTRIES = {}
+
+        # github and git-subdir sources: rules 4 and 5 still report what is wrong
+        # with them, and owner ruling D-164 refuses each of them as well.
         for bad in ("someone/gamma", "jposluns/", "jposluns/gamma/extra", "Jposluns/gamma",
                     "https://github.com/jposluns/gamma", "jposluns/..", None):
-            refused("the github repo {!r}".format(bad), _changed(hub + ("repo",), bad),
-                    '"repo" is required')
+            refused("the github repo {!r}".format(bad), hub(repo=bad), '"repo" is required',
+                    d164=1)
         for bad in ("someone/alpha", "https://github.com/someone/alpha",
                     "https://gitlab.com/jposluns/alpha", "http://github.com/jposluns/alpha",
                     "https://github.com.evil.example/jposluns/alpha",
                     "https://evil.example/github.com/jposluns/alpha",
                     "git@github.com:jposluns/alpha.git", None):
-            refused("the git-subdir url {!r}".format(bad), _changed(git + ("url",), bad),
-                    '"url" is required')
+            refused("the git-subdir url {!r}".format(bad), git(url=bad), '"url" is required',
+                    d164=1)
         for bad in ("../plugin", "/plugin", "plugin/../..", "plugin//x", "plugin\\x", "", None):
-            refused("the git-subdir path {!r}".format(bad), _changed(git + ("path",), bad),
-                    '"path"')
-        refused("a git-subdir source without a path", _changed(git + ("path",)), '"path"')
+            refused("the git-subdir path {!r}".format(bad), git(path=bad), '"path"', d164=1)
+        refused("a git-subdir source without a path", git(path=_DROP), '"path"', d164=1)
         for bad in ("abc123", _COMMIT.upper(), _COMMIT + "0", 40):
-            refused("the sha {!r}".format(bad), _changed(hub + ("sha",), bad), '"sha" must be')
+            refused("the sha {!r}".format(bad), hub(sha=bad), '"sha" must be', d164=1)
         for bad in ("", "-x", "two words", None):
-            refused("the ref {!r}".format(bad), _changed(hub + ("ref",), bad), '"ref" must be')
+            refused("the ref {!r}".format(bad), hub(ref=bad), '"ref" must be', d164=1)
+        refused("an unknown field in a github source", hub(path="plugin"),
+                "unknown field(s): path", d164=1)
 
         # archive sources.
         for bad, fragment in (
@@ -921,6 +1417,138 @@ def self_test():
             record("the self-test has no network access", "tried to use the network" in str(error),
                    str(error))
 
+        # The checksums (owner ruling D-164): the block made from the file.
+        raw = (json.dumps(_second(), indent=2) + "\n").encode("utf-8")
+        digest = hashlib.sha256(raw).hexdigest()
+        block = checksum_block(raw)
+        record("the checksums block lists the file, then each entry in the file's order",
+               block == [
+                   "<!-- checksums:begin -->",
+                   "| File | What it is | SHA-256 |",
+                   "|---|---|---|",
+                   "| `.claude-plugin/marketplace.json` | the marketplace file | `{}` |".format(
+                       digest),
+                   "| `beta-plugin-1.0.0.zip` | the `beta` plugin | `{}` |".format(_SHA_A),
+                   "| `other-plugin-1.0.0.zip` | the `delta` plugin | `{}` |".format(_SHA_B),
+                   "<!-- checksums:end -->"], repr(block))
+        longer = checksum_block(raw + b"\n")
+        record("one more byte in the file changes the block's line for the file, and no other",
+               longer is not None and longer[3] != block[3]
+               and longer[:3] + longer[4:] == block[:3] + block[4:], repr(longer))
+        record("the SHA256SUMS line names the file after its sha256",
+               sums_line(raw) == digest + "  .claude-plugin/marketplace.json\n",
+               repr(sums_line(raw)))
+        document = _second()
+        document["plugins"][_ENTRY] = dict(held)
+        held_raw = (json.dumps(document, indent=2) + "\n").encode("utf-8")
+        HELD_ENTRIES = {"beta": held}
+        held_block = checksum_block(held_raw)
+        HELD_ENTRIES = {}
+        record("the checksums block lists a held entry as not pinned",
+               held_block == block[:3] + [
+                   "| `.claude-plugin/marketplace.json` | the marketplace file | `{}` |".format(
+                       hashlib.sha256(held_raw).hexdigest()),
+                   "| none | the `beta` plugin, held under owner decision D-165 | not pinned |",
+                   block[5], block[6]], repr(held_block))
+        record("no checksums block for the same file when no entry is held",
+               checksum_block(held_raw) is None)
+        for name, document in (
+                ("a git-subdir entry", git()),
+                ("a github entry", hub()),
+                ("a relative path source", _changed(source, "./plugins/alpha")),
+                ("an entry without a sha256", _changed(source + ("sha256",))),
+                ("an entry with an uppercase sha256",
+                 _changed(source + ("sha256",), _SHA_A.upper())),
+                ("an archive url on another host",
+                 _changed(source + ("url",), "https://evil.example/" + _ZIP)),
+                ("an entry without a name", _changed(entry + ("name",))),
+                ("an entry name with a backtick", _changed(entry + ("name",), "be`ta")),
+                ("an entry that is text", _changed(entry, "beta")),
+                ("plugins that is an object", _changed(("plugins",), {})),
+                ("no plugins", _changed(("plugins",)))):
+            made = checksum_block(json.dumps(document).encode("utf-8"))
+            problems, _notes, _calls = run(document)
+            record("no checksums block for {}, which the check also refuses".format(name),
+                   made is None and bool(problems), repr((made, problems)))
+        for name, body in (("broken JSON", b"{"), ("a top-level array", b"[]"),
+                           ("a byte order mark", b"\xef\xbb\xbf" + raw)):
+            record("no checksums block for " + name, checksum_block(body) is None)
+
+        # The checksums: the README block.
+        readme = "# Title\n\nSome text.\n\n" + "\n".join(block) + "\n\nMore text.\n"
+        older = readme.replace(digest, "0" * 64)
+        one_block = "must hold one checksums block"
+        stale = "does not match the marketplace file"
+        outside = "outside the checksums block"
+        for name, text, base, wanted in (
+                ("accepts the block", readme, None, []),
+                ("accepts the block when the base README has an older block and the same text "
+                 "outside it", readme, older, []),
+                ("refuses an older sha256 for the file", older, None, [stale]),
+                ("refuses another sha256 for a zip", readme.replace(_SHA_B, _SHA_A), None,
+                 [stale]),
+                ("refuses a block with a row missing", readme.replace(block[5] + "\n", ""), None,
+                 [stale]),
+                ("refuses a block with a row added",
+                 readme.replace(block[5], block[5] + "\n" + block[4]), None, [stale]),
+                ("refuses a block with its rows in another order",
+                 readme.replace(block[4] + "\n" + block[5], block[5] + "\n" + block[4]), None,
+                 [stale]),
+                ("refuses a block with a blank line in it",
+                 readme.replace(block[4], block[4] + "\n"), None, [stale]),
+                ("refuses a block with text after a row",
+                 readme.replace(block[5], block[5] + " x"), None, [stale]),
+                ("refuses a README with no block", "# Title\n", None, [one_block]),
+                ("refuses a README with two blocks", readme + "\n".join(block) + "\n", None,
+                 [one_block]),
+                ("refuses a README with no end line", readme.replace(CHECKSUMS_END, ""), None,
+                 [one_block]),
+                ("refuses a README with the end line before the begin line",
+                 "\n".join([CHECKSUMS_END] + block[1:-1] + [CHECKSUMS_BEGIN]) + "\n", None,
+                 [one_block]),
+                ("refuses a begin line with a space after it",
+                 readme.replace(CHECKSUMS_BEGIN, CHECKSUMS_BEGIN + " "), None, [one_block]),
+                ("refuses an indented end line",
+                 readme.replace(CHECKSUMS_END, "  " + CHECKSUMS_END), None, [one_block]),
+                ("refuses CRLF line ends", readme.replace("\n", "\r\n"), None, [one_block]),
+                ("refuses changed text after the block, with a base README",
+                 readme.replace("More text.", "Other text."), readme, [outside]),
+                ("refuses changed text before the block, with a base README",
+                 readme.replace("Some text.", "Other text."), older, [outside]),
+                ("refuses a line added after the block, with a base README",
+                 readme + "One more line.\n", readme, [outside]),
+                ("does not compare the text outside the block without a base README",
+                 readme.replace("More text.", "Other text."), None, []),
+                ("refuses a base README with no block", readme, "# Title\n",
+                 ["base README holds no single checksums block"]),
+                ("reports an older block and changed text outside it as two problems",
+                 older.replace("More text.", "Other text."), readme, [stale, outside])):
+            problems = check_readme(text, block, base)
+            record("README: " + name,
+                   len(problems) == len(wanted) and all(
+                       fragment in problem for fragment, problem in zip(wanted, problems)),
+                   "wanted {}, got {}".format(wanted, problems))
+
+        # The checksums: SHA256SUMS.
+        good_sums = sums_line(raw).encode("ascii")
+        record("SHA256SUMS: accepts the one line", check_sums(good_sums, raw) == [],
+               repr(check_sums(good_sums, raw)))
+        for name, body in (
+                ("without its final newline", good_sums[:-1]),
+                ("with a CRLF line end", good_sums[:-1] + b"\r\n"),
+                ("twice", good_sums + good_sums),
+                ("with a blank line after it", good_sums + b"\n"),
+                ("in binary mode", good_sums.replace(b"  .", b" *.")),
+                ("with one space", good_sums.replace(b"  .", b" .")),
+                ("with another file name", good_sums.replace(b".claude-plugin/", b"")),
+                ("with another sha256", (_SHA_A + "  " + CATALOGUE_NAME + "\n").encode("ascii")),
+                ("with an uppercase sha256",
+                 (digest.upper() + "  " + CATALOGUE_NAME + "\n").encode("ascii")),
+                ("replaced by an empty file", b"")):
+            problems = check_sums(body, raw)
+            record("SHA256SUMS: refuses the line " + name,
+                   len(problems) == 1 and "must be the one line" in problems[0], repr(problems))
+
         # The command line, with a local fixture for the hashes lookup.
         with tempfile.TemporaryDirectory() as folder:
             market = Path(folder) / "marketplace.json"
@@ -936,8 +1564,23 @@ def self_test():
 
             status, text = command(_fixture())
             record("command line passes the fixture",
-                   status == 0 and "OK, 3 plugin(s) checked" in text
-                   and "not the published list" in text, repr((status, text)))
+                   status == 0 and "OK, 1 plugin(s) checked" in text
+                   and "not the published list" in text and "readme" not in text
+                   and "sums file" not in text, repr((status, text)))
+            status, text = command(git())
+            record("command line fails a git-subdir entry",
+                   status == 1 and "FAIL, 1 problem(s)" in text and D164_PROBLEM in text
+                   and "owner ruling D-164" in text and "hashes source" not in text,
+                   repr((status, text)))
+            status, text = command(_changed(entry + ("hooks",), {}))
+            record("command line fails an entry field that is not accepted",
+                   status == 1 and "FAIL, 1 problem(s)" in text
+                   and "field(s) not accepted: hooks" in text, repr((status, text)))
+            status, text = command(_changed(("hooks",), {}))
+            record("command line fails a top-level field that is not accepted",
+                   status == 1 and "FAIL, 1 problem(s)" in text
+                   and "problem: the top level holds only" in text
+                   and "field(s) not accepted: hooks" in text, repr((status, text)))
             status, text = command(_changed(source + ("sha256",), _SHA_B))
             record("command line fails a wrong sha256",
                    status == 1 and "FAIL, 1 problem(s)" in text, repr((status, text)))
@@ -955,8 +1598,160 @@ def self_test():
             record("command line fails a missing marketplace file",
                    status == 1 and "could not read the file" in out.getvalue(),
                    repr((status, out.getvalue())))
+
+            # The command line and the checksums (owner ruling D-164).
+            readme_path = Path(folder) / "README.md"
+            base_path = Path(folder) / "README-base.md"
+            sums_path = Path(folder) / "SHA256SUMS"
+            absent = str(Path(folder) / "absent")
+            with_readme = ["--readme", str(readme_path)]
+            with_base = with_readme + ["--readme-base", str(base_path)]
+            with_sums = ["--sums-file", str(sums_path)]
+
+            def write(document):
+                """Write the file with a README, a base README and a SHA256SUMS that match."""
+                market.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+                body = market.read_bytes()
+                made = checksum_block(body) or [CHECKSUMS_BEGIN, CHECKSUMS_END]
+                text = "# Title\n\n" + "\n".join(made) + "\n\nMore text.\n"
+                readme_path.write_text(text, encoding="utf-8")
+                base_path.write_text(text.replace(hashlib.sha256(body).hexdigest(), "0" * 64),
+                                     encoding="utf-8")
+                sums_path.write_bytes(sums_line(body).encode("ascii"))
+                return text
+
+            def call(arguments):
+                """Run the command line. A usage error gives the text "usage error 2"."""
+                out = io.StringIO()
+                try:
+                    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+                        status = main(arguments)
+                except SystemExit as error:
+                    status = "usage error {}".format(error.code)
+                return status, out.getvalue()
+
+            def checked(*options):
+                return call([str(market), "--hashes-file", str(hashes_path)] + list(options))
+
+            def case(name, options, status, *fragments, without=()):
+                got, text = checked(*options)
+                record("command line " + name,
+                       got == status and all(fragment in text for fragment in fragments)
+                       and not any(fragment in text for fragment in without),
+                       repr((got, text)))
+
+            good_text = write(_fixture())
+            case("passes a README, a base README and a SHA256SUMS that match",
+                 with_base + with_sums, 0, "OK, 1 plugin(s) checked", "readme: ",
+                 "base readme: ", "sums file: ")
+            readme_path.write_text(good_text.replace(_SHA_A, _SHA_B), encoding="utf-8")
+            case("fails a README with another sha256 for a zip", with_base + with_sums, 1,
+                 "FAIL, 1 problem(s)", "README: the checksums block does not match")
+            readme_path.write_text(good_text.replace("More text.", "Other text."),
+                                   encoding="utf-8")
+            case("fails a README changed outside the block, with a base README", with_base, 1,
+                 "FAIL, 1 problem(s)", "outside the checksums block")
+            case("passes that README without a base README", with_readme, 0,
+                 "OK, 1 plugin(s) checked")
+            readme_path.write_bytes(b"\xff\xfe")
+            case("fails a README that is not UTF-8", with_readme, 1, "FAIL, 1 problem(s)",
+                 "README: ", "is not UTF-8")
+            readme_path.write_bytes(b" " * (MAX_TEXT_BYTES + 1))
+            case("fails an oversized README", with_readme, 1, "FAIL, 1 problem(s)",
+                 "README: ", "is larger than")
+            write(_fixture())
+            sums_path.write_bytes(b"")
+            case("fails an empty SHA256SUMS", with_base + with_sums, 1, "FAIL, 1 problem(s)",
+                 "SHA256SUMS: must be the one line")
+            write(_fixture())
+            case("fails a missing README", ["--readme", absent], 1, "FAIL, 1 problem(s)",
+                 "README: could not read")
+            case("fails a missing base README", with_readme + ["--readme-base", absent], 1,
+                 "FAIL, 1 problem(s)", "base README: could not read")
+            case("fails a missing SHA256SUMS", ["--sums-file", absent], 1, "FAIL, 1 problem(s)",
+                 "SHA256SUMS: could not read")
+            write(_changed(source + ("sha256",), _SHA_B))
+            case("fails a wrong sha256 even when the README and SHA256SUMS list it",
+                 with_base + with_sums, 1, "FAIL, 1 problem(s)", "does not match the hashes.txt")
+            write(_changed(("hooks",), {}))
+            case("fails a top-level field that is not accepted even when the README and "
+                 "SHA256SUMS list the file", with_base + with_sums, 1, "FAIL, 1 problem(s)",
+                 "problem: the top level holds only", "field(s) not accepted: hooks")
+            case("prints no checksums for a file with a top-level field that is not accepted",
+                 ["--print-checksums"], 1, "FAIL, 1 problem(s)",
+                 without=(CHECKSUMS_BEGIN, "line for SHA256SUMS"))
+            write(git())
+            case("reports a README as not checked when the file has a git-subdir entry",
+                 with_readme + with_sums, 1, "FAIL, 2 problem(s)", D164_PROBLEM,
+                 "README: the checksums block was not checked")
+            HELD_ENTRIES = {"beta": held}
+            write(git())
+            case("passes a held entry whose README lists it as not pinned",
+                 with_base + with_sums, 0, "OK, 1 plugin(s) checked", "note: " + held_note,
+                 "readme: ")
+            case("prints the checksums of a file with a held entry", ["--print-checksums"], 0,
+                 "| none | the `beta` plugin, held under owner decision D-165 | not pinned |")
+            HELD_ENTRIES = {}
+            case("fails the same files when no entry is held", with_base + with_sums, 1,
+                 "FAIL, 2 problem(s)", D164_PROBLEM,
+                 "README: the checksums block was not checked")
+            write(_fixture())
+            body = market.read_bytes()
+            printed = ("checksums block for README.md:\n" + "\n".join(checksum_block(body))
+                       + "\nline for SHA256SUMS:\n" + sums_line(body))
+            got, text = checked("--print-checksums")
+            record("command line prints the checksums of a file that passes",
+                   got == 0 and text.endswith(printed) and "OK, 1 plugin(s) checked" in text,
+                   repr((got, text)))
+            write(_changed(source + ("sha256",), _SHA_B))
+            case("prints no checksums for a file with a wrong sha256", ["--print-checksums"], 1,
+                 "FAIL, 1 problem(s)", without=(CHECKSUMS_BEGIN, "line for SHA256SUMS"))
+            write(git())
+            case("prints no checksums for a file with a git-subdir entry", ["--print-checksums"],
+                 1, "FAIL, 1 problem(s)", without=(CHECKSUMS_BEGIN, "line for SHA256SUMS"))
+            write(_fixture())
+            got, text = call([absent, "--hashes-file", str(hashes_path)] + with_base + with_sums)
+            record("command line fails a missing marketplace file without naming a README or "
+                   "SHA256SUMS that it did not compare",
+                   got == 1 and "FAIL, 1 problem(s)" in text and "could not read the file" in text
+                   and "readme" not in text and "sums file" not in text, repr((got, text)))
+            for name, arguments in (
+                    ("--readme-base without --readme", ["--readme-base", str(base_path)]),
+                    ("--print-checksums with --readme", ["--print-checksums"] + with_readme),
+                    ("--print-checksums with --sums-file", ["--print-checksums"] + with_sums)):
+                case("refuses " + name, arguments, "usage error 2")
+            for option in (["--print-checksums"], with_readme, with_sums,
+                           ["--readme-base", str(base_path)]):
+                got, text = call(["--self-test"] + option)
+                record("command line refuses --self-test with " + option[0],
+                       got == "usage error 2", repr((got, text)))
+
+            # With no FILE, the repository's own README.md and SHA256SUMS are checked.
+            DEFAULT_PATH, DEFAULT_README, DEFAULT_SUMS = market, readme_path, sums_path
+            local = ["--hashes-file", str(hashes_path)]
+            got, text = call(local)
+            record("command line with no FILE checks the README.md and SHA256SUMS beside it",
+                   got == 0 and "readme: {}".format(readme_path) in text
+                   and "sums file: {}".format(sums_path) in text, repr((got, text)))
+            readme_path.write_text("# Title\n", encoding="utf-8")
+            got, text = call(local)
+            record("command line with no FILE fails a README with no block",
+                   got == 1 and "FAIL, 1 problem(s)" in text and one_block in text,
+                   repr((got, text)))
+            got, text = call(local + ["--print-checksums"])
+            record("command line with no FILE prints the checksums without checking that README",
+                   got == 0 and text.endswith(printed) and "readme" not in text,
+                   repr((got, text)))
+            write(_fixture())
+            sums_path.unlink()
+            got, text = call(local)
+            record("command line with no FILE fails a missing SHA256SUMS",
+                   got == 1 and "FAIL, 1 problem(s)" in text
+                   and "SHA256SUMS: could not read" in text, repr((got, text)))
     finally:
         _https_get = real_get
+        DEFAULT_PATH, DEFAULT_README, DEFAULT_SUMS = real_paths
+        HELD_ENTRIES = real_held
 
     failed = [item for item in results if not item[1]]
     for name, passed, detail in results:

@@ -99,7 +99,9 @@ jobs:
       # README.md and pr-file-3 its SHA256SUMS. README.md with no folder and
       # .claude-plugin/marketplace.json are the base branch's own files, from
       # the work tree. With --base the checker refuses a removed or renamed
-      # entry, another host for an entry and a lower version of an entry.
+      # entry, another host for an entry, a lower version of an entry, a held
+      # entry that the base branch does not hold unchanged and a changed field
+      # outside plugins.
       - name: Check the pull request's marketplace.json, README.md and SHA256SUMS
         shell: bash
         run: |

@@ -1,4 +1,8 @@
-# The owner is the required reviewer for the check, the checker and this file.
+# The owner is the code owner of the check, the checker and this file. This
+# file alone does not make the owner's review a condition of a merge. The
+# review is required only when the branch protection of main has "Require
+# review from Code Owners" turned on (see the README); without that setting
+# GitHub only asks the owner for a review.
 # Entry-only pull requests change only .claude-plugin/marketplace.json, the
 # checksums table in README.md and SHA256SUMS. None of the three has a code
 # owner; the marketplace-check job judges them, and it fails when README.md

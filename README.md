@@ -52,7 +52,10 @@ The checker checks that:
 - every entry is a zip source; a repository source is refused, pinned or not
   (owner ruling D-164). The one exception is an entry that the checker's
   `HELD_ENTRIES` table names field for field (owner decision D-165); the
-  checksums table below lists every held entry as not pinned;
+  checksums table below lists every held entry as not pinned. In a pull
+  request an entry is held only when `main` holds the same entry, field for
+  field: a held entry is not added, and an entry that `main` holds as a zip
+  does not become held again;
 - a zip source is an https URL on a known host, its file name is
   `<entry name>-plugin-<version>.zip`, and its SHA-256 matches the one
   `release` row for that artifact and version at
@@ -61,19 +64,25 @@ The checker checks that:
 - compared with the list on `main`, no entry is removed or renamed, the zip of
   an entry stays on the host that it has on `main`, and its version is not
   lower than the version on `main`. A new entry may use any known host;
+- compared with the list on `main`, every field outside `plugins` is the same:
+  the marketplace `name` and `description`, each field of `owner` and each
+  field of `metadata`. None is added, removed or changed;
 - the checksums table in this README and the `SHA256SUMS` file match the list.
 
 The job passes only when the pull request changes
 `.claude-plugin/marketplace.json`, the checksums table in this README and
 `SHA256SUMS`, and nothing else. Any other change needs the owner's review: the
-job fails for it, and
-`.github/CODEOWNERS` names the owner as the required reviewer for `.github/`,
-`tools/` and the `CODEOWNERS` file itself.
+job fails for it. `.github/CODEOWNERS` names the owner as the code owner of
+`.github/` and `tools/`, and so of the `CODEOWNERS` file itself. That file
+alone does not make the owner's review a condition of a merge: the "Require
+review from Code Owners" setting of `main` does (see the administrator's
+settings below).
 
-Removing or renaming an entry, moving an entry to another host and going back
-to an earlier version need the owner's review too: the job fails for each of
-them. The `main-check` job has no earlier list to compare with, so it does not
-apply these three rules.
+Removing or renaming an entry, moving an entry to another host, going back to
+an earlier version, making an entry held and changing a field outside
+`plugins` need the owner's review too: the job fails for each of them. The
+`main-check` job has no earlier list to compare with, so it does not apply
+these rules.
 
 The job judges a pull request against `main` as it was when the job started,
 and nothing starts it again when `main` changes. So a pull request is merged
@@ -88,11 +97,24 @@ a checksums table or a `SHA256SUMS` that the checker refuses.
 The job takes its workflow and checker from the base branch of the pull
 request. A branch other than `main` can hold an older check, so a pull request
 against such a branch can pass a check that `main` would fail. Nothing in this
-repository can stop that. The repository administrator must:
+repository can stop that, and no file in this repository turns on a branch
+protection setting. The repository administrator must:
 
 - keep `main` the only branch whose `marketplace-check` result is accepted.
   The simple way is to delete every other branch and to allow no new one;
-- require the `marketplace-check` job on `main`.
+- require the `marketplace-check` job on `main`;
+- turn on "Require a pull request before merging" for `main`, and under it
+  "Require review from Code Owners".
+
+GitHub's documentation says this of "Require review from Code Owners": a pull
+request that changes a file with a code owner is merged only after a code
+owner of that file has approved it. Here the files with a code owner are the
+ones under `.github/` and `tools/`. The setting adds nothing for the list, this
+README and `SHA256SUMS`, which have no code owner; the `marketplace-check` job
+judges those. Without the setting, `CODEOWNERS` only makes GitHub ask the owner
+for a review, and a pull request can be merged without that review. The
+setting has not been tested on this repository, and this repository does not
+record which settings `main` has.
 
 The workflow also runs when a pull request is edited, so that a pull request
 whose base branch is changed to `main` is checked again, by the check of

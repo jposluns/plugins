@@ -38,7 +38,8 @@ What it checks:
      been applied to it. The one exception is an entry that equals a value
      of HELD_ENTRIES field for field (owner decision D-165): it passes with
      a note. HELD_ENTRIES is part of this file, so only a reviewed change to
-     the checker can add to it.
+     the checker can add to it. With --base FILE, rule 12 lets an entry be
+     held only when the base file holds the same entry.
   8. The checksums (owner ruling D-164). README.md holds one checksums block,
      from the line <!-- checksums:begin --> to the line <!-- checksums:end -->,
      equal to the block made from the file: the sha256 of the file itself,
@@ -64,8 +65,14 @@ What it checks:
      entry in the base file, the url host equals the base entry's host, and
      the version is not lower than the base entry's version. Two versions
      that differ must both be numbers with "." between them; 1.0 equals
-     1.0.0. A new entry may use any allow-listed host. Without --base none of
-     this is checked: the check of main after a merge has no base file.
+     1.0.0. A new entry may use any allow-listed host. An entry is held (rule
+     7) only when the base file holds an entry of that name that equals it
+     field for field. So a held entry is not added, and an entry that the
+     base file pins, or holds in any other form, does not become held. Every
+     top-level field other than plugins equals the base file's field, and so
+     does every field of owner and of metadata: none is added, removed or
+     changed. Without --base none of this is checked: the check of main
+     after a merge has no base file.
 
 What it does not check: it does not download a zip or clone a repository, so
 it does not compare the entry name with the plugin's own plugin.json, and it
@@ -76,6 +83,8 @@ ties the artifact to the entry name. It does not know what a project's digest
 covers (the head of hashes.txt says), so it does not refuse a row whose
 digest covers another file than the zip; the sha256 must still equal the
 row's. Rule 12 compares the host of a url with the base file, not its path.
+It compares fields as JSON values, so it does not refuse other spacing or
+another order of the same fields.
 
 Any failure to read a file or to fetch hashes.txt counts as a problem.
 Exit status: 0 when clean, 1 when there are problems, 2 for a usage error.
@@ -134,7 +143,10 @@ D164_PROBLEM = "every entry must be an archive source pinned by sha256"
 # is exact. A held entry is reported in a note, and in the checksums block as
 # not pinned. Empty means that no entry is held. A hold ends in one owner pull
 # request: it replaces the entry in the list with its archive entry, removes
-# the entry from this table and updates the README and SHA256SUMS.
+# the entry from this table and updates the README and SHA256SUMS. With --base
+# an entry is held only when the base branch's file holds the same entry (rule
+# 12), so an entry that the base branch pins does not become held again, even
+# while this table still names it.
 HELD_ENTRIES = {
     "secureconfig": {
         "name": "secureconfig",
@@ -168,6 +180,12 @@ BASE_PROBLEM = ("base: the base branch's marketplace file is not a list whose en
                 "have a name of their own, so the file could not be compared with it")
 BASE_REMOVED_PROBLEM = ("base: the entry {!r} of the base branch is not in the file; an entry "
                         "is not removed or renamed without the owner's review")
+BASE_HELD_PROBLEM = ("the base branch does not hold this entry unchanged, so it is not held "
+                     "(owner decision D-165): an entry is held only when the base branch holds "
+                     "the same entry, field for field, and an entry that is pinned or absent "
+                     "there does not become held")
+BASE_FIELD_PROBLEM = ('base: the field "{}" is not the same as in the base branch\'s file; a '
+                      'change outside "plugins" needs the owner\'s review')
 
 # Owner ruling D-164: the checksums that README.md and SHA256SUMS list.
 CATALOGUE_NAME = ".claude-plugin/marketplace.json"
@@ -422,7 +440,7 @@ def _version_key(version):
 
 
 def _base_entries(base_raw):
-    """Return ({entry name: entry}, None) or (None, problem) for the base branch's file.
+    """Return (document, {entry name: entry}, None) or (None, None, problem) for the base file.
 
     Every entry must be an object with a text name that no other entry uses,
     or nothing can be compared with the file (rule 12).
@@ -430,14 +448,40 @@ def _base_entries(base_raw):
     document, problem = _parse_json(base_raw)
     plugins = None if problem or not isinstance(document, dict) else document.get("plugins")
     if not isinstance(plugins, list):
-        return None, BASE_PROBLEM
+        return None, None, BASE_PROBLEM
     entries = {}
     for entry in plugins:
         name = entry.get("name") if isinstance(entry, dict) else None
         if not isinstance(name, str) or name in entries:
-            return None, BASE_PROBLEM
+            return None, None, BASE_PROBLEM
         entries[name] = entry
-    return entries, None
+    return document, entries, None
+
+
+_ABSENT = object()
+
+
+def _changed_fields(document, base_document):
+    """Return the names of the fields outside "plugins" that the base file holds otherwise.
+
+    Rule 12. A field that only one of the two files holds is named too. When
+    both files hold an object for a top-level field (owner and metadata), each
+    field of that object is named on its own, as in "owner.url". The values
+    that rules 2 and 10 accept outside "plugins" hold text only, so "==" is
+    exact for a file that has no other problem.
+    """
+    names = []
+    for key in sorted(set(document) | set(base_document)):
+        value, base_value = document.get(key, _ABSENT), base_document.get(key, _ABSENT)
+        if key == "plugins" or value == base_value:
+            continue
+        if isinstance(value, dict) and isinstance(base_value, dict):
+            inner = sorted(set(value) | set(base_value))
+            names.extend("{}.{}".format(key, name) for name in inner
+                         if value.get(name, _ABSENT) != base_value.get(name, _ABSENT))
+        else:
+            names.append(key)
+    return names
 
 
 def _compare_with_base(url, version, base):
@@ -640,10 +684,13 @@ def check_marketplace(raw, load_hashes, base_raw=None):
 
     base_entries = {}
     if base_raw is not None:
-        base_entries, problem = _base_entries(base_raw)
+        base_document, base_entries, problem = _base_entries(base_raw)
         if problem:
             base_entries = {}
             problems.append(problem)
+        else:
+            problems.extend(BASE_FIELD_PROBLEM.format(name)
+                            for name in _changed_fields(document, base_document))
 
     hashes = _Hashes(load_hashes)
     seen = set()
@@ -675,8 +722,15 @@ def check_marketplace(raw, load_hashes, base_raw=None):
         if "source" not in entry:
             problems.append('{}: missing required field "source"'.format(label))
         else:
-            _check_source(entry["source"], label, problems, notes, hashes, _is_held(entry),
-                          tied, base_entries.get(tied))
+            # Rule 12: with a base file, an entry is held only when that file holds the
+            # same entry. A base file that cannot be compared with holds no entry.
+            base_entry = base_entries.get(tied)
+            held = _is_held(entry)
+            lapsed = held and base_raw is not None and base_entry != entry
+            _check_source(entry["source"], label, problems, notes, hashes, held and not lapsed,
+                          tied, base_entry)
+            if lapsed:
+                problems.append("{}: {}".format(label, BASE_HELD_PROBLEM))
     problems.extend(BASE_REMOVED_PROBLEM.format(name) for name in base_entries
                     if name not in seen)
     return problems, notes, len(plugins)
@@ -890,7 +944,9 @@ def main(argv=None):
                         help="read the hashes list from a local file instead of fetching it")
     parser.add_argument("--base", metavar="FILE",
                         help="the base branch's marketplace.json: refuse a removed or renamed "
-                             "entry, another host for an entry and a lower version (rule 12)")
+                             "entry, another host for an entry, a lower version, a held entry "
+                             "that this file does not hold unchanged and a changed field "
+                             "outside plugins (rule 12)")
     parser.add_argument("--readme", metavar="FILE",
                         help="check the checksums block of this README against the file")
     parser.add_argument("--readme-base", metavar="FILE",
@@ -1376,6 +1432,22 @@ def self_test():
         record("each entry that HELD_ENTRIES ships with ({}) is held under its own name and "
                "has no problem".format(", ".join(sorted(real_held)) or "none"),
                all(passed for _name, _problems, passed in shipped), repr(shipped))
+        shipped = []
+        for name, item in sorted(real_held.items()):
+            document = _changed(("plugins",), [item])
+            pinned = _changed(("plugins",), [{"name": name, "source": {
+                "source": "archive", "sha256": _SHA_A,
+                "url": "https://posluns.dev/{}-plugin-1.0.0.zip".format(name)}}])
+            same, _notes, _calls = run(document, base=document)
+            back, _notes, _calls = run(document, base=pinned)
+            added, _notes, _calls = run(document, base=_changed(("plugins",), []))
+            shipped.append((name, same, back, added, not same and all(
+                len(problems) == 2 and D164_PROBLEM in problems[0]
+                and BASE_HELD_PROBLEM in problems[1] for problems in (back, added))))
+        record("each entry that HELD_ENTRIES ships with ({}) is held when the base file holds "
+               "it, and not when the base file pins that name or has no entry of that "
+               "name".format(", ".join(sorted(real_held)) or "none"),
+               all(item[-1] for item in shipped), repr(shipped))
         HELD_ENTRIES = {}
 
         # github and git-subdir sources: rules 4 and 5 still report what is wrong
@@ -1648,9 +1720,151 @@ def self_test():
               base=git())
         refused("a file without the base file's held entry", only_other,
                 "base: the entry 'beta' " + removed, base=git())
+
+        # Rule 12: an entry is held only when the base file holds the same entry.
+        not_held = where + ": the base branch does not hold this entry unchanged, so it is not held"
+        clean("a held entry that the base file holds with other spacing and its fields in "
+              "another order", git(), lookups=0, note=held_note,
+              base=json.dumps(git(), indent=4, sort_keys=True).encode("utf-8"))
+        refused("the held entry in place of the base file's archive entry of that name", git(),
+                not_held, d164=1, base=_fixture())
+        refused("the held entry in place of the base file's archive entry on another host and "
+                "of a later version", git(), not_held, d164=1, base=beta("2.0.0", "posluns.ca"))
+        refused("the held entry when the base file has no entry", git(), not_held, d164=1,
+                base=_changed(("plugins",), []))
+        document = _second()
+        document["plugins"][_ENTRY] = dict(held)
+        refused("the held entry as a new entry beside the base file's entry, which is still "
+                "looked up", document, not_held, d164=1, base=only_other)
+        for name, base in (
+                ("another ref", git(ref="dev")),
+                ("a sha beside the ref", git(sha=_COMMIT)),
+                ("no ref", git(ref=_DROP)),
+                ("another path", git(path="plugins/beta")),
+                ("the https form of the same repository",
+                 git(url="https://github.com/jposluns/alpha")),
+                ("a github source", hub()),
+                ("a relative path source", _changed(source, "./plugins/beta")),
+                ("no source", _changed(source))):
+            refused("the held entry when the base file's entry of that name has " + name, git(),
+                    not_held, d164=1, base=base)
+        base = git()
+        base["plugins"][_ENTRY]["description"] = "Another text."
+        refused("the held entry when the base file's entry of that name has another "
+                "description", git(), not_held, d164=1, base=base)
+        base = git()
+        del base["plugins"][_ENTRY]["description"]
+        refused("the held entry when the base file's entry of that name has no description",
+                git(), not_held, d164=1, base=base)
+        base = git()
+        base["plugins"][_ENTRY]["hooks"] = {}
+        refused("the held entry when the base file's entry of that name has one more field",
+                git(), not_held, d164=1, base=base)
+        step_one, _notes, _calls = run(_fixture(), base=git())
+        step_two, _notes, _calls = run(git(), base=_fixture())
+        record("accepts the change of a held entry to its archive entry, and then refuses the "
+               "change back to the held entry",
+               not step_one and len(step_two) == 2 and D164_PROBLEM in step_two[0]
+               and step_two[1] == where + ": " + BASE_HELD_PROBLEM, repr((step_one, step_two)))
+        problems, _notes, _calls = run(git(), base=b"{")
+        record("reports a held entry and a base file that is broken JSON as three problems: no "
+               "entry is held against a base file that cannot be compared with",
+               len(problems) == 3 and problems[0] == BASE_PROBLEM and D164_PROBLEM in problems[1]
+               and not_held in problems[2], repr(problems))
+        clean("that held entry when no base file is given", git(), lookups=0, note=held_note)
         HELD_ENTRIES = {}
+        problems, _notes, _calls = run(git(), base=git())
+        record("refuses an entry that equals the base file's git-subdir entry when no entry is "
+               "held", len(problems) == 1 and problems[0].startswith(where + ": a git-subdir ")
+               and D164_PROBLEM in problems[0], repr(problems))
         clean("an archive entry in place of a git-subdir entry of the base file that is not "
               "held", _fixture(), lookups=1, base=git())
+
+        # Rule 12: every field outside "plugins" equals the base file's field.
+        def outside(path=(), value=_DROP):
+            """A file with every field that rule 10 accepts, one of them replaced or removed."""
+            document = _fixture()
+            document["owner"] = {"name": OWNER_NAME, "email": "owner@example.test",
+                                 "url": "https://posluns.dev"}
+            document["metadata"] = {"description": "Self-test fixture.", "version": "1.0.0"}
+            node = document
+            for key in path[:-1]:
+                node = node[key]
+            if path and value is _DROP:
+                del node[path[-1]]
+            elif path:
+                node[path[-1]] = value
+            return document
+
+        def differs(field):
+            return 'base: the field "{}" is not the same as in the base branch\'s file'.format(
+                field)
+
+        clean("a file whose fields outside plugins equal the base file's", outside(), lookups=1,
+              base=outside())
+        clean("a file whose base file has the same fields with other spacing and in another "
+              "order", outside(), lookups=1,
+              base=json.dumps(outside(), indent=4, sort_keys=True).encode("utf-8"))
+        document = outside()
+        document["plugins"].append(_second()["plugins"][1])
+        clean("a new entry in a file whose fields outside plugins equal the base file's",
+              document, lookups=1, base=outside())
+        for name, path, value, field in (
+                ("another description", ("description",), "Another text.", "description"),
+                ("a description with one more space", ("description",), "Self-test fixture. ",
+                 "description"),
+                ("no description", ("description",), _DROP, "description"),
+                ("another owner url", ("owner", "url"), "https://posluns.ca", "owner.url"),
+                ("no owner url", ("owner", "url"), _DROP, "owner.url"),
+                ("another owner email", ("owner", "email"), "other@example.test", "owner.email"),
+                ("no owner email", ("owner", "email"), _DROP, "owner.email"),
+                ("another metadata description", ("metadata", "description"), "Another text.",
+                 "metadata.description"),
+                ("no metadata description", ("metadata", "description"), _DROP,
+                 "metadata.description"),
+                ("another metadata version", ("metadata", "version"), "1.0.1",
+                 "metadata.version"),
+                ("no metadata version", ("metadata", "version"), _DROP, "metadata.version"),
+                ("no metadata", ("metadata",), _DROP, "metadata")):
+            refused("{} when the base file has the fixture's".format(name), outside(path, value),
+                    differs(field), base=outside())
+            refused("the fixture's fields when the base file has {}".format(name), outside(),
+                    differs(field), base=outside(path, value))
+            clean("{} when no base file is given".format(name), outside(path, value), lookups=1)
+        for name, path, value, field in (
+                ("another marketplace name", ("name",), "other", "name"),
+                ("no marketplace name", ("name",), _DROP, "name"),
+                ("another owner name", ("owner", "name"), "Someone Else", "owner.name"),
+                ("an owner that is text", ("owner",), OWNER_NAME, "owner"),
+                ("no owner", ("owner",), _DROP, "owner"),
+                ("a metadata version that is a number", ("metadata", "version"), 1,
+                 "metadata.version"),
+                ("a metadata that is text", ("metadata",), "1.0.0", "metadata"),
+                ("a top-level field that is not accepted", ("$schema",), "x", "$schema"),
+                ("an owner field that is not accepted", ("owner", "hooks"), {}, "owner.hooks")):
+            refused("the fixture's fields when the base file has {}".format(name), outside(),
+                    differs(field), base=outside(path, value))
+        document = outside(("description",), "Another text.")
+        document["owner"]["url"] = "https://posluns.ca"
+        del document["metadata"]["version"]
+        problems, _notes, _calls = run(document, base=outside())
+        record("reports three fields that are not the base file's as three problems, in the "
+               "order of their names",
+               problems == [BASE_FIELD_PROBLEM.format(field) for field in (
+                   "description", "metadata.version", "owner.url")], repr(problems))
+        problems, _notes, _calls = run(outside(("metadata",), {}), base=outside())
+        record("reports an empty metadata as one problem for each metadata field of the base "
+               "file", problems == [BASE_FIELD_PROBLEM.format(field) for field in (
+                   "metadata.description", "metadata.version")], repr(problems))
+        document = outside(("description",), "Another text.")
+        document["plugins"] = []
+        problems, _notes, _calls = run(document, base=outside())
+        record("reports another description and a removed entry as two problems",
+               len(problems) == 2 and problems[0] == BASE_FIELD_PROBLEM.format("description")
+               and "'beta' " + removed in problems[1], repr(problems))
+        problems, _notes, _calls = run(outside(("description",), "Another text."), base=b"{")
+        record("names no field when the base file cannot be compared with",
+               problems == [BASE_PROBLEM], repr(problems))
 
         # Rule 12: a base file that cannot be compared with.
         for name, base in (
@@ -2063,6 +2277,36 @@ def self_test():
             base_market.write_bytes(market.read_bytes())
             case("prints the checksums of a file that equals its base file",
                  with_list + ["--print-checksums"], 0, "base list: ", CHECKSUMS_BEGIN)
+            base_market.write_text(json.dumps(_changed(("description",), "Another text.")),
+                                   encoding="utf-8")
+            case("fails a description that is not the base file's, with the README and "
+                 "SHA256SUMS", with_list + with_base + with_sums, 1, "FAIL, 1 problem(s)",
+                 'problem: base: the field "description" is not the same as in the base')
+            base_market.write_text(json.dumps(_changed(("owner", "url"), "https://posluns.dev")),
+                                   encoding="utf-8")
+            case("fails an owner without the url of the base file's owner", with_list, 1,
+                 "FAIL, 1 problem(s)", 'problem: base: the field "owner.url" is not the same')
+            case("passes that file with no base file, with the README and SHA256SUMS",
+                 with_base + with_sums, 0, "OK, 1 plugin(s) checked")
+            HELD_ENTRIES = {"beta": held}
+            write(git())
+            base_market.write_bytes(market.read_bytes())
+            case("passes a held entry that the base file also holds, with the README and "
+                 "SHA256SUMS", with_list + with_base + with_sums, 0, "OK, 1 plugin(s) checked",
+                 "note: " + held_note)
+            base_market.write_text(json.dumps(_fixture()), encoding="utf-8")
+            case("fails the held entry when the base file pins that entry, even when the README "
+                 "lists it as not pinned", with_list + with_base + with_sums, 1,
+                 "FAIL, 2 problem(s)", D164_PROBLEM, "problem: " + not_held,
+                 without=("note: " + held_note,))
+            case("prints no checksums for the held entry when the base file pins that entry",
+                 with_list + ["--print-checksums"], 1, "FAIL, 2 problem(s)",
+                 without=(CHECKSUMS_BEGIN, "line for SHA256SUMS"))
+            case("passes the same files with no base file", with_base + with_sums, 0,
+                 "OK, 1 plugin(s) checked", "note: " + held_note)
+            HELD_ENTRIES = {}
+            write(_fixture())
+            base_market.write_bytes(market.read_bytes())
             for name, arguments in (
                     ("--readme-base without --readme", ["--readme-base", str(base_path)]),
                     ("--print-checksums with --readme", ["--print-checksums"] + with_readme),

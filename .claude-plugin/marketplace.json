@@ -3,7 +3,7 @@
   "owner": {
     "name": "Jeff Posluns"
   },
-  "description": "Plugins for the jposluns projects. Each entry points at the project's own public repository or release zip.",
+  "description": "Plugins for the jposluns projects. Each entry is the project's release zip, pinned by SHA-256.",
   "plugins": [
     {
       "name": "secureconfig",

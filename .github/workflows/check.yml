@@ -6,13 +6,33 @@ name: Marketplace check
 #
 # Rules for every later change to this file:
 #   - no step checks out, imports, sources or runs a file from the pull request;
-#   - the pull request's marketplace.json is read from git as a blob and given
-#     to the base branch's checker as data;
+#   - the pull request's marketplace.json, README.md and SHA256SUMS are read
+#     from git as blobs and given to the base branch's checker as data;
 #   - the token stays at contents: read, no secret is used, and
 #     persist-credentials stays false.
+#
+# A marketplace-check result is for the base branch as it was when the run
+# started. Nothing in this file starts a new run when the base branch moves.
+# The branch protection of main must therefore require this check together
+# with "Require branches to be up to date before merging" (see the README).
+#
+# The "edited" type is in the list for a pull request whose base branch is
+# changed: the run then starts again, with the workflow and the checker of the
+# new base branch. This is an inference about GitHub's behaviour and has not
+# been tested on this repository. "edited" also starts a run when only the
+# title or the text of the pull request changes; that run repeats the check.
+# A branch other than main can hold an older check, so main must be the only
+# branch whose marketplace-check result is accepted (see the README).
+#
+# The main-check job runs on a push to main. It runs main's own checker on
+# main's own files. It cannot stop a merge; it shows a main that its own
+# checker refuses.
 
 on:
   pull_request_target:
+    types: [opened, synchronize, reopened, edited]
+  push:
+    branches: [main]
 
 permissions:
   contents: read
@@ -20,10 +40,13 @@ permissions:
 jobs:
   marketplace-check:
     name: marketplace-check
+    if: github.event_name == 'pull_request_target'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
       CATALOGUE: .claude-plugin/marketplace.json
+      README: README.md
+      SUMS: SHA256SUMS
       PR_NUMBER: ${{ github.event.pull_request.number }}
       PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
     steps:
@@ -45,7 +68,7 @@ jobs:
 
       # Fetch the pull request's commits into the object store. Nothing is
       # checked out, so the work tree stays the base branch.
-      - name: Read the pull request's marketplace.json as data
+      - name: Read the pull request's marketplace.json, README.md and SHA256SUMS as data
         shell: bash
         run: |
           set -u
@@ -57,23 +80,40 @@ jobs:
             echo "The run for the newer commit decides."
             exit 1
           fi
-          entry="$(git ls-tree "$PR_HEAD_SHA" -- "$CATALOGUE")"
-          case "$entry" in
-            "100644 blob "*) ;;
-            *)
-              echo "${CATALOGUE} must be a regular file in the pull request. Found: ${entry:-nothing}"
-              exit 1
-              ;;
-          esac
-          blob="$(git rev-parse --verify "${PR_HEAD_SHA}:${CATALOGUE}")"
-          git cat-file blob "$blob" > "${RUNNER_TEMP}/marketplace.json"
+          number=0
+          for path in "$CATALOGUE" "$README" "$SUMS"; do
+            number=$((number + 1))
+            entry="$(git ls-tree "$PR_HEAD_SHA" -- "$path")"
+            case "$entry" in
+              "100644 blob "*) ;;
+              *)
+                echo "${path} must be a regular file in the pull request. Found: ${entry:-nothing}"
+                exit 1
+                ;;
+            esac
+            blob="$(git rev-parse --verify "${PR_HEAD_SHA}:${path}")"
+            git cat-file blob "$blob" > "${RUNNER_TEMP}/pr-file-${number}"
+          done
 
-      - name: Check the pull request's marketplace.json
+      # pr-file-1 is the pull request's marketplace.json, pr-file-2 its
+      # README.md and pr-file-3 its SHA256SUMS. README.md with no folder and
+      # .claude-plugin/marketplace.json are the base branch's own files, from
+      # the work tree. With --base the checker refuses a removed or renamed
+      # entry, another host for an entry, a lower version of an entry, a held
+      # entry that the base branch does not hold unchanged and a changed field
+      # outside plugins.
+      - name: Check the pull request's marketplace.json, README.md and SHA256SUMS
         shell: bash
-        run: python3 -I -B tools/check_marketplace.py "${RUNNER_TEMP}/marketplace.json"
+        run: |
+          python3 -I -B tools/check_marketplace.py "${RUNNER_TEMP}/pr-file-1" \
+            --base .claude-plugin/marketplace.json \
+            --readme "${RUNNER_TEMP}/pr-file-2" --readme-base README.md \
+            --sums-file "${RUNNER_TEMP}/pr-file-3"
 
-      # Only an entry-only pull request can pass. A change to any other file
-      # needs the owner's review (see .github/CODEOWNERS and the README).
+      # Only an entry-only pull request can pass. It changes marketplace.json,
+      # and with it the checksums table in README.md and the line of SHA256SUMS,
+      # which the step above has compared with the list. A change to any other
+      # file needs the owner's review (see .github/CODEOWNERS and the README).
       - name: Entry-only check
         shell: bash
         run: |
@@ -87,11 +127,39 @@ jobs:
           fi
           changed="$(git -c core.quotePath=true diff --name-only --no-renames \
             --ignore-submodules=none "$merge_base" "$PR_HEAD_SHA" --)"
-          if [ "$changed" != "$CATALOGUE" ]; then
-            echo "This check passes only when the pull request changes ${CATALOGUE} and no other file."
+          # The three paths, in the order in which git prints them.
+          wanted="$(printf '%s\n' "$CATALOGUE" "$README" "$SUMS")"
+          if [ "$changed" != "$wanted" ]; then
+            echo "This check passes only when the pull request changes these files and no other:"
+            printf '%s\n' "$wanted"
             echo "This pull request changes:"
             printf '%s\n' "${changed:-(no file)}"
             echo "A change to any other file needs the owner's review."
             exit 1
           fi
-          echo "The pull request changes only ${CATALOGUE}."
+          echo "The pull request changes only ${CATALOGUE}, ${README} and ${SUMS}."
+
+  # After a merge: main's own list, README.md and SHA256SUMS, judged by main's
+  # own checker. No pull request is involved, so nothing is fetched.
+  main-check:
+    name: main-check
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Checker self-test
+        shell: bash
+        run: python3 -I -B tools/check_marketplace.py --self-test
+
+      - name: Check main's marketplace.json, README.md and SHA256SUMS
+        shell: bash
+        run: python3 -I -B tools/check_marketplace.py

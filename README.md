@@ -21,17 +21,9 @@ The `marketplace-check` job keeps that table equal to the list, so this README
 holds no other table of plugins. The name of a plugin in that table is the
 `<project>` of the install line above.
 
-secureconfig is held in the list under owner decision D-165. It installs from
-the `main` branch of its repository, so it is the one entry that is not pinned
-by SHA-256, and no checksum here covers it. The checker reports that entry in a
-note and does not refuse it. Every other entry, and any change to this one,
-must be a release zip whose SHA-256 has a row at https://posluns.dev/hashes.txt
-(owner ruling D-164).
-
-The hold ends when secureconfig has a plugin zip with a row there. It ends in
-one pull request that the owner reviews: it replaces the entry with the zip
-entry, empties the checker's `HELD_ENTRIES` table, and updates this section,
-the checksums table and `SHA256SUMS`.
+Every entry must be a release zip whose SHA-256 has a row at
+https://posluns.dev/hashes.txt (owner ruling D-164). Since owner ruling D-171
+every entry is one, and no entry is held.
 
 ## What is checked
 

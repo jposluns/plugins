@@ -146,16 +146,9 @@ D164_PROBLEM = "every entry must be an archive source pinned by sha256"
 # the entry from this table and updates the README and SHA256SUMS. With --base
 # an entry is held only when the base branch's file holds the same entry (rule
 # 12), so an entry that the base branch pins does not become held again, even
-# while this table still names it.
-HELD_ENTRIES = {
-    "secureconfig": {
-        "name": "secureconfig",
-        "description": "The secureconfig plugin, from the plugin folder of the "
-                       "jposluns/secureconfig repository.",
-        "source": {"source": "git-subdir", "url": "jposluns/secureconfig", "path": "plugin",
-                   "ref": "main"},
-    },
-}
+# while this table still names it. The table is empty since owner ruling D-171:
+# secureconfig, the one entry it held, is now a pinned archive entry.
+HELD_ENTRIES = {}
 HELD_NOTE = "held under owner decision D-165"
 # Rule 9: the fields an entry may hold. Without this limit an entry could carry
 # plugin parts of its own, which the sha256 of the zip does not cover.

@@ -7,7 +7,7 @@
   "plugins": [
     {
       "name": "secureconfig",
-      "description": "The secureconfig plugin, from the plugin folder of the jposluns/secureconfig repository.",
+      "description": "The secureconfig plugin, as a versioned zip from secureconfig.ai.",
       "source": {
         "source": "archive",
         "url": "https://secureconfig.ai/downloads/secureconfig-plugin-1.0.1351.zip",

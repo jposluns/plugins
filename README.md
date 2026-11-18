@@ -148,8 +148,8 @@ pinned.
 <!-- checksums:begin -->
 | File | What it is | SHA-256 |
 |---|---|---|
-| `.claude-plugin/marketplace.json` | the marketplace file | `b808698267ca132eb1b932e83a291ed2f77493759e4025ab128e01bafb17a72f` |
-| none | the `secureconfig` plugin, held under owner decision D-165 | not pinned |
+| `.claude-plugin/marketplace.json` | the marketplace file | `bc6f9e163e02ab6f55e1c59249be9e298b91b7206931b3e1ab33d6b0ed8d6b6b` |
+| `secureconfig-plugin-1.0.1351.zip` | the `secureconfig` plugin | `677b3836d8fc69100424b352520d3f53c04667705a4c65e440cc942431d52c1a` |
 | `auditthis-plugin-2.19.0.zip` | the `auditthis` plugin | `56a8541dbb4c502b0ef771434b673c9b312ea5790977dddca2580800e4249185` |
 <!-- checksums:end -->
 

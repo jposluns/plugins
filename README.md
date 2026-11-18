@@ -140,7 +140,7 @@ pinned.
 <!-- checksums:begin -->
 | File | What it is | SHA-256 |
 |---|---|---|
-| `.claude-plugin/marketplace.json` | the marketplace file | `e56ea05385fbb69a4fc1ee5eee2c5b89d4f30acc8951fedf28158671e519273d` |
+| `.claude-plugin/marketplace.json` | the marketplace file | `b1c489394e510c77ee8f0aa7cd69386b5b6bb06b54e7abbcbf133b7440f84fde` |
 | `secureconfig-plugin-1.0.1351.zip` | the `secureconfig` plugin | `677b3836d8fc69100424b352520d3f53c04667705a4c65e440cc942431d52c1a` |
 | `auditthis-plugin-2.20.0.zip` | the `auditthis` plugin | `23abb06b8d780b393a5963bd2ca9acfe9d6a38e78dc0c260297670f13ddeb144` |
 <!-- checksums:end -->

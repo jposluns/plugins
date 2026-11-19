@@ -140,9 +140,9 @@ pinned.
 <!-- checksums:begin -->
 | File | What it is | SHA-256 |
 |---|---|---|
-| `.claude-plugin/marketplace.json` | the marketplace file | `63978ce600388a2ed1745451976d9566d802e193b957d65697cb406133fc2c48` |
+| `.claude-plugin/marketplace.json` | the marketplace file | `ebda52c783e7f199380744a7e035cfe18a1fe0ee5869ca063dcabb661dd333fa` |
 | `secureconfig-plugin-1.0.1351.zip` | the `secureconfig` plugin | `677b3836d8fc69100424b352520d3f53c04667705a4c65e440cc942431d52c1a` |
-| `auditthis-plugin-2.21.0.zip` | the `auditthis` plugin | `2860461f680e8e4419fd26cf9d378cbbefe95fb691e75653d5b75071056cba61` |
+| `auditthis-plugin-2.21.1.zip` | the `auditthis` plugin | `2f08766179de325ac748d795c0e802b18a32434000fb2caf3fda83a79ff1bad0` |
 <!-- checksums:end -->
 
 The table and `SHA256SUMS` are in this repository, beside the list. They show

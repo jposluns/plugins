@@ -10,8 +10,8 @@
       "description": "The secureconfig plugin, as a versioned zip from secureconfig.ai.",
       "source": {
         "source": "archive",
-        "url": "https://secureconfig.ai/downloads/secureconfig-plugin-1.0.1351.zip",
-        "sha256": "677b3836d8fc69100424b352520d3f53c04667705a4c65e440cc942431d52c1a"
+        "url": "https://secureconfig.ai/downloads/secureconfig-plugin-1.0.1395.zip",
+        "sha256": "e14435156e995a250f1dd52597297ead221cc16ad9dedf17712c5755c6f3cd79"
       }
     },
     {
